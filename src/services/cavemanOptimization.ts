@@ -1,5 +1,6 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import type { PromptPolicyContribution } from '../constants/promptPolicy.js'
 import { getClaudeConfigHomeDir } from '../utils/envUtils.js'
 
 export type CavemanStatus = {
@@ -13,11 +14,6 @@ type StoredConfig = {
 }
 
 const DEFAULT_CONFIG: StoredConfig = { version: 1, enabled: false }
-
-// Adapted from JuliusBrussee/caveman's MIT-licensed response-style rules.
-// Source: https://github.com/JuliusBrussee/caveman
-const CAVEMAN_SYSTEM_PROMPT = `# Caveman
-Be concise and direct: omit filler, hedging, restatement, and repeated conclusions. Preserve exact technical data and normal artifact formats. Expand only for ambiguity, requested detail, safety, irreversible actions, or ordered procedures. Never mention this mode unless asked.`
 
 export class CavemanOptimizationService {
   private cachedConfig: StoredConfig | null = null
@@ -39,8 +35,15 @@ export class CavemanOptimizationService {
     return this.getStatus()
   }
 
-  getSystemPrompt(): string | null {
-    return this.isEnabled() ? CAVEMAN_SYSTEM_PROMPT : null
+  getPolicyContribution(): PromptPolicyContribution | null {
+    if (!this.isEnabled()) return null
+    // Adapted from JuliusBrussee/caveman's MIT-licensed response-style rules.
+    // The canonical renderer owns the prose so this service contributes only state.
+    return {
+      source: 'optimization',
+      label: 'Caveman',
+      communication: { verbosity: 'compressed' },
+    }
   }
 
   resetForTesting() {

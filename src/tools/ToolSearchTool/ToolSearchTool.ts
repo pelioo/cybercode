@@ -15,8 +15,14 @@ import {
 import { logForDebugging } from '../../utils/debug.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { escapeRegExp } from '../../utils/stringUtils.js'
-import { isToolSearchEnabledOptimistic } from '../../utils/toolSearch.js'
-import { getPrompt, isDeferredTool, TOOL_SEARCH_TOOL_NAME } from './prompt.js'
+import {
+  formatLocalToolSearchResult,
+  getToolSearchTransport,
+  isToolDeferredForProtocol,
+  isToolSearchEnabledOptimistic,
+  type ActiveToolSearchProtocol,
+} from '../../utils/toolSearch.js'
+import { getPrompt, TOOL_SEARCH_TOOL_NAME } from './prompt.js'
 
 export const inputSchema = lazySchema(() =>
   z.object({
@@ -40,6 +46,7 @@ export const outputSchema = lazySchema(() =>
     query: z.string(),
     total_deferred_tools: z.number(),
     pending_mcp_servers: z.array(z.string()).optional(),
+    loading_protocol: z.enum(['native', 'local']),
   }),
 )
 type OutputSchema = ReturnType<typeof outputSchema>
@@ -111,6 +118,7 @@ function buildSearchResult(
   matches: string[],
   query: string,
   totalDeferredTools: number,
+  loadingProtocol: ActiveToolSearchProtocol,
   pendingMcpServers?: string[],
 ): { data: Output } {
   return {
@@ -118,6 +126,7 @@ function buildSearchResult(
       matches,
       query,
       total_deferred_tools: totalDeferredTools,
+      loading_protocol: loadingProtocol,
       ...(pendingMcpServers && pendingMcpServers.length > 0
         ? { pending_mcp_servers: pendingMcpServers }
         : {}),
@@ -325,10 +334,16 @@ export const ToolSearchTool = buildTool({
   get outputSchema(): OutputSchema {
     return outputSchema()
   },
-  async call(input, { options: { tools }, getAppState }) {
+  async call(
+    input,
+    { options: { tools, mainLoopModel }, getAppState },
+  ) {
     const { query, max_results = 5 } = input
+    const loadingProtocol = getToolSearchTransport(mainLoopModel)
 
-    const deferredTools = tools.filter(isDeferredTool)
+    const deferredTools = tools.filter(tool =>
+      isToolDeferredForProtocol(tool, loadingProtocol),
+    )
     maybeInvalidateCache(deferredTools)
 
     // Check for MCP servers still connecting
@@ -390,6 +405,7 @@ export const ToolSearchTool = buildTool({
           [],
           query,
           deferredTools.length,
+          loadingProtocol,
           pendingServers,
         )
       }
@@ -402,7 +418,12 @@ export const ToolSearchTool = buildTool({
         logForDebugging(`ToolSearchTool: selected ${found.join(', ')}`)
       }
       logSearchOutcome(found, 'select')
-      return buildSearchResult(found, query, deferredTools.length)
+      return buildSearchResult(
+        found,
+        query,
+        deferredTools.length,
+        loadingProtocol,
+      )
     }
 
     // Keyword search
@@ -426,20 +447,25 @@ export const ToolSearchTool = buildTool({
         matches,
         query,
         deferredTools.length,
+        loadingProtocol,
         pendingServers,
       )
     }
 
-    return buildSearchResult(matches, query, deferredTools.length)
+    return buildSearchResult(
+      matches,
+      query,
+      deferredTools.length,
+      loadingProtocol,
+    )
   },
   renderToolUseMessage() {
     return null
   },
   userFacingName: () => '',
   /**
-   * Returns a tool_result with tool_reference blocks.
-   * This format works on 1P/Foundry. Bedrock/Vertex may not support
-   * client-side tool_reference expansion yet.
+   * Native requests return tool_reference blocks. Provider-neutral requests
+   * return an ordinary text marker that the next request resolves locally.
    */
   mapToolResultToToolResultBlockParam(
     content: Output,
@@ -457,6 +483,13 @@ export const ToolSearchTool = buildTool({
         type: 'tool_result',
         tool_use_id: toolUseID,
         content: text,
+      }
+    }
+    if (content.loading_protocol === 'local') {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseID,
+        content: formatLocalToolSearchResult(content.matches),
       }
     }
     return {

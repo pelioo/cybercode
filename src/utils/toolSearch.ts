@@ -1,9 +1,9 @@
 /**
  * Tool Search utilities for dynamically discovering deferred tools.
  *
- * When enabled, deferred tools (MCP and shouldDefer tools) are sent with
- * defer_loading: true and discovered via ToolSearchTool rather than being
- * loaded upfront.
+ * Native Anthropic requests use defer_loading/tool_reference. Other providers
+ * use CyberCode's local discovery marker and ordinary tool calls, so deferred
+ * schemas never leak provider-specific content blocks onto the wire.
  */
 
 import memoize from 'lodash-es/memoize.js'
@@ -22,9 +22,11 @@ import type { AgentDefinition } from '../tools/AgentTool/loadAgentsDir.js'
 import {
   formatDeferredToolLine,
   isDeferredTool,
+  isLocallyDeferredTool,
   TOOL_SEARCH_TOOL_NAME,
 } from '../tools/ToolSearchTool/prompt.js'
 import type { Message } from '../types/message.js'
+import { stripProjectMemoryContext } from '../sessionSearch/projectMemoryContext.js'
 import {
   countToolDefinitionTokens,
   TOOL_TOKEN_COUNT_OVERHEAD,
@@ -127,8 +129,11 @@ const getDeferredToolTokenCount = memoize(
     getToolPermissionContext: () => Promise<ToolPermissionContext>,
     agents: AgentDefinition[],
     model: string,
+    protocol: ActiveToolSearchProtocol,
   ): Promise<number | null> => {
-    const deferredTools = tools.filter(t => isDeferredTool(t))
+    const deferredTools = tools.filter(t =>
+      isToolDeferredForProtocol(t, protocol),
+    )
     if (deferredTools.length === 0) return 0
 
     try {
@@ -144,21 +149,115 @@ const getDeferredToolTokenCount = memoize(
       return null // Fall back to char heuristic
     }
   },
-  (tools: Tools) =>
+  (tools: Tools, _permissionContext, _agents, model, protocol) =>
+    `${model}:${protocol}:` +
     tools
-      .filter(t => isDeferredTool(t))
+      .filter(t => isToolDeferredForProtocol(t, protocol))
       .map(t => t.name)
       .join(','),
 )
 
 /**
- * Tool search mode. Determines how deferrable tools (MCP + shouldDefer) are
- * surfaced:
+ * Tool search mode. Determines whether the active protocol's deferrable tools
+ * are surfaced dynamically:
  *   - 'tst': Tool Search Tool — deferred tools discovered via ToolSearchTool (always enabled)
  *   - 'tst-auto': auto — tools deferred only when they exceed threshold
  *   - 'standard': tool search disabled — all tools exposed inline
  */
 export type ToolSearchMode = 'tst' | 'tst-auto' | 'standard'
+
+/** Wire protocol used for dynamic tool loading on a specific request. */
+export type ToolSearchProtocol = 'native' | 'local' | 'full'
+export type ActiveToolSearchProtocol = Exclude<ToolSearchProtocol, 'full'>
+
+const LIGHTWEIGHT_CONVERSATION_PHRASES = new Set([
+  '你好',
+  '你好啊',
+  '您好',
+  '您好啊',
+  '嗨',
+  '哈喽',
+  '哈啰',
+  '在吗',
+  '早',
+  '早上好',
+  '中午好',
+  '下午好',
+  '晚上好',
+  '晚安',
+  '谢谢',
+  '多谢',
+  '再见',
+  '你是谁',
+  '你叫什么',
+  '你叫什么名字',
+  'hello',
+  'hello there',
+  'hi',
+  'hi there',
+  'hey',
+  'good morning',
+  'good afternoon',
+  'good evening',
+  'thanks',
+  'thank you',
+  'who are you',
+  'what is your name',
+  'こんにちは',
+  'おはよう',
+  'こんばんは',
+  'ありがとう',
+  '안녕',
+  '안녕하세요',
+  '감사합니다',
+])
+
+function getUserMessageText(message: Message): string | null {
+  if (message.type !== 'user' || message.isMeta) return null
+  const content = message.message.content
+  if (typeof content === 'string') return content
+  return content
+    .filter(block => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
+}
+
+function hasToolHistory(messages: Message[]): boolean {
+  return messages.some(message => {
+    if (message.type === 'assistant') {
+      return message.message.content.some(block => block.type === 'tool_use')
+    }
+    if (message.type !== 'user' || !Array.isArray(message.message.content)) {
+      return false
+    }
+    return message.message.content.some(block => block.type === 'tool_result')
+  })
+}
+
+/**
+ * Pure conversational turns do not need tens of thousands of tool-schema
+ * tokens. Keep this deliberately exact-match and disable it once tools have
+ * appeared in history, so an ordinary coding request always receives the full
+ * dynamic tool-loading path on its next turn.
+ */
+export function isLightweightConversationTurn(messages: Message[]): boolean {
+  if (hasToolHistory(messages)) return false
+
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const text = getUserMessageText(messages[index]!)
+    if (text === null) continue
+
+    const normalized = stripProjectMemoryContext(text)
+      .trim()
+      .toLocaleLowerCase()
+      .replace(/[!！?？。.，,~～]+$/g, '')
+      .replace(/\s+/g, ' ')
+
+    return LIGHTWEIGHT_CONVERSATION_PHRASES.has(normalized)
+  }
+
+  return false
+}
 
 /**
  * Determines the tool search mode from ENABLE_TOOL_SEARCH.
@@ -167,21 +266,9 @@ export type ToolSearchMode = 'tst' | 'tst-auto' | 'standard'
  *   auto / auto:1-99      tst-auto
  *   true / auto:0         tst
  *   false / auto:100      standard
- *   (unset)               tst (default: always defer MCP and shouldDefer tools)
+ *   (unset)               tst (default: always use dynamic loading)
  */
 export function getToolSearchMode(): ToolSearchMode {
-  // CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is a kill switch for beta API
-  // features. Tool search emits defer_loading on tool definitions and
-  // tool_reference content blocks — both require the API to accept a beta
-  // header. When the kill switch is set, force 'standard' so no beta shapes
-  // reach the wire, even if ENABLE_TOOL_SEARCH is also set. This is the
-  // explicit escape hatch for proxy gateways that the heuristic in
-  // isToolSearchEnabledOptimistic doesn't cover.
-  // github.com/anthropics/claude-code/issues/20031
-  if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS)) {
-    return 'standard'
-  }
-
   const value = process.env.ENABLE_TOOL_SEARCH
 
   // Handle auto:N syntax - check edge cases first
@@ -194,7 +281,7 @@ export function getToolSearchMode(): ToolSearchMode {
 
   if (isEnvTruthy(value)) return 'tst'
   if (isEnvDefinedFalsy(process.env.ENABLE_TOOL_SEARCH)) return 'standard'
-  return 'tst' // default: always defer MCP and shouldDefer tools
+  return 'tst' // default: always use the provider's safe loading protocol
 }
 
 /**
@@ -252,12 +339,90 @@ export function modelSupportsToolReference(model: string): boolean {
 }
 
 /**
+ * Whether the active API transport can accept Anthropic's tool_reference
+ * content blocks. Custom Anthropic-compatible gateways default to the local
+ * protocol unless the user explicitly opts into native forwarding.
+ */
+export function providerSupportsToolReference(): boolean {
+  if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS)) {
+    return false
+  }
+  if (getAPIProvider() !== 'firstParty') return true
+  return (
+    isFirstPartyAnthropicBaseUrl() ||
+    isEnvTruthy(process.env.CYBERCODE_ENABLE_TOOL_REFERENCE)
+  )
+}
+
+/** Select the safe active transport without applying threshold/tool checks. */
+export function getToolSearchTransport(
+  model: string,
+): ActiveToolSearchProtocol {
+  const explicitlyEnabled = isEnvTruthy(
+    process.env.CYBERCODE_ENABLE_TOOL_REFERENCE,
+  )
+  const normalizedModel = model.toLowerCase()
+  const isAnthropicModel = ['claude', 'sonnet', 'opus'].some(pattern =>
+    normalizedModel.includes(pattern),
+  )
+  return providerSupportsToolReference() &&
+    modelSupportsToolReference(model) &&
+    (isAnthropicModel || explicitlyEnabled)
+    ? 'native'
+    : 'local'
+}
+
+/** Apply the protocol's current deferral policy to one tool. */
+export function isToolDeferredForProtocol(
+  tool: Tool,
+  protocol: ToolSearchProtocol,
+): boolean {
+  if (protocol === 'full') return false
+  return protocol === 'local'
+    ? isLocallyDeferredTool(tool)
+    : isDeferredTool(tool)
+}
+
+export function getDeferredToolNamesForProtocol(
+  tools: Tools,
+  protocol: ToolSearchProtocol,
+): Set<string> {
+  return new Set(
+    tools
+      .filter(tool => isToolDeferredForProtocol(tool, protocol))
+      .map(tool => tool.name),
+  )
+}
+
+/**
+ * Select the schemas sent on this request. Full mode removes ToolSearch and
+ * sends every real tool; active modes add only previously discovered deferred
+ * tools while keeping all non-deferred tools available.
+ */
+export function filterToolsForToolSearchProtocol(
+  tools: Tools,
+  protocol: ToolSearchProtocol,
+  discoveredToolNames: ReadonlySet<string>,
+): Tools {
+  if (protocol === 'full') {
+    return tools.filter(tool =>
+      !toolMatchesName(tool, TOOL_SEARCH_TOOL_NAME),
+    )
+  }
+
+  return tools.filter(tool => {
+    if (toolMatchesName(tool, TOOL_SEARCH_TOOL_NAME)) return true
+    if (!isToolDeferredForProtocol(tool, protocol)) return true
+    return discoveredToolNames.has(tool.name)
+  })
+}
+
+/**
  * Check if tool search *might* be enabled (optimistic check).
  *
  * Returns true if tool search could potentially be enabled, without checking
  * dynamic factors like model support or threshold. Use this for:
  * - Including ToolSearchTool in base tools (so it's available if needed)
- * - Preserving tool_reference fields in messages (can be stripped later)
  * - Checking if ToolSearchTool should report itself as enabled
  *
  * Returns false only when tool search is definitively disabled (standard mode).
@@ -279,32 +444,6 @@ export function isToolSearchEnabledOptimistic(): boolean {
     return false
   }
 
-  // tool_reference is a beta content type that third-party API gateways
-  // (ANTHROPIC_BASE_URL proxies) typically don't support. When the provider
-  // is 'firstParty' but the base URL points elsewhere, the proxy will reject
-  // tool_reference blocks with a 400. Vertex/Bedrock/Foundry are unaffected —
-  // they have their own endpoints and beta headers.
-  // https://github.com/anthropics/claude-code/issues/30912
-  //
-  // Some proxies do support tool_reference, but ENABLE_TOOL_SEARCH only
-  // selects the loading mode; it is commonly inherited from Claude Code
-  // settings and is not proof of protocol compatibility. Keep capability
-  // opt-in separate so an old ENABLE_TOOL_SEARCH=true cannot make Kimi, GLM,
-  // or another compatibility endpoint emit an unsupported content block.
-  if (
-    getAPIProvider() === 'firstParty' &&
-    !isFirstPartyAnthropicBaseUrl() &&
-    !isEnvTruthy(process.env.CYBERCODE_ENABLE_TOOL_REFERENCE)
-  ) {
-    if (!loggedOptimistic) {
-      loggedOptimistic = true
-      logForDebugging(
-        `[ToolSearch:optimistic] disabled: ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL} is not a first-party Anthropic host. Set CYBERCODE_ENABLE_TOOL_REFERENCE=true only if your proxy forwards tool_reference blocks.`,
-      )
-    }
-    return false
-  }
-
   if (!loggedOptimistic) {
     loggedOptimistic = true
     logForDebugging(
@@ -312,6 +451,16 @@ export function isToolSearchEnabledOptimistic(): boolean {
     )
   }
   return true
+}
+
+/**
+ * Sync guard for generic message normalization, which has no model argument.
+ * Request-time normalization performs the final model-aware native/local check.
+ */
+export function isNativeToolSearchEnabledOptimistic(): boolean {
+  return (
+    getToolSearchMode() !== 'standard' && providerSupportsToolReference()
+  )
 }
 
 /**
@@ -336,8 +485,11 @@ async function calculateDeferredToolDescriptionChars(
   tools: Tools,
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
   agents: AgentDefinition[],
+  protocol: ActiveToolSearchProtocol,
 ): Promise<number> {
-  const deferredTools = tools.filter(t => isDeferredTool(t))
+  const deferredTools = tools.filter(t =>
+    isToolDeferredForProtocol(t, protocol),
+  )
   if (deferredTools.length === 0) return 0
 
   const sizes = await Promise.all(
@@ -360,42 +512,45 @@ async function calculateDeferredToolDescriptionChars(
 }
 
 /**
- * Check if tool search (MCP tool deferral with tool_reference) is enabled for a specific request.
+ * Resolve the dynamic-loading protocol for a specific request.
  *
  * This is the definitive check that includes:
  * - MCP mode (Tst, TstAuto, McpCli, Standard)
- * - Model compatibility (haiku doesn't support tool_reference)
+ * - Native tool_reference compatibility, with local loading as fallback
  * - ToolSearchTool availability (must be in tools list)
  * - Threshold check for TstAuto mode
  *
  * Use this when making actual API calls where all context is available.
  *
- * @param model The model to check for tool_reference support
+ * @param model The active model
  * @param tools Array of available tools (including MCP tools)
  * @param getToolPermissionContext Function to get tool permission context
  * @param agents Array of agent definitions
  * @param source Optional identifier for the caller (for debugging)
- * @returns true if tool search should be enabled for this request
+ * @returns native, local, or full
  */
-export async function isToolSearchEnabled(
+export async function resolveToolSearchProtocol(
   model: string,
   tools: Tools,
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
   agents: AgentDefinition[],
   source?: string,
-): Promise<boolean> {
+  messages?: Message[],
+): Promise<ToolSearchProtocol> {
   const mcpToolCount = count(tools, t => t.isMcp)
 
   // Helper to log the mode decision event
   function logModeDecision(
-    enabled: boolean,
+    protocol: ToolSearchProtocol,
     mode: ToolSearchMode,
     reason: string,
     extraProps?: Record<string, number>,
   ): void {
     logEvent('tengu_tool_search_mode_decision', {
-      enabled,
+      enabled: protocol !== 'full',
       mode: mode as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      protocol:
+        protocol as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       reason:
         reason as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       // Log the actual model being checked, not the session's main model.
@@ -412,30 +567,8 @@ export async function isToolSearchEnabled(
 
   const mode = getToolSearchMode()
   if (mode === 'standard') {
-    logModeDecision(false, mode, 'standard_mode')
-    return false
-  }
-
-  // Keep the definitive request-time decision aligned with message
-  // normalization. In particular, third-party Anthropic-compatible gateways
-  // usually reject the beta tool_reference content blocks even when the model
-  // itself is capable of ordinary tool use.
-  if (!isToolSearchEnabledOptimistic()) {
-    logForDebugging(
-      `Tool search disabled for model '${model}': the active API provider does not support tool_reference blocks.`,
-    )
-    logModeDecision(false, 'standard', 'provider_unsupported')
-    return false
-  }
-
-  // Check if model supports tool_reference
-  if (!modelSupportsToolReference(model)) {
-    logForDebugging(
-      `Tool search disabled for model '${model}': model does not support tool_reference blocks. ` +
-        `This feature is only available on Claude Sonnet 4+, Opus 4+, and newer models.`,
-    )
-    logModeDecision(false, 'standard', 'model_unsupported')
-    return false
+    logModeDecision('full', mode, 'standard_mode')
+    return 'full'
   }
 
   // Check if ToolSearchTool is available (respects disallowedTools)
@@ -443,14 +576,29 @@ export async function isToolSearchEnabled(
     logForDebugging(
       `Tool search disabled: ToolSearchTool is not available (may have been disallowed via disallowedTools).`,
     )
-    logModeDecision(false, 'standard', 'mcp_search_unavailable')
-    return false
+    logModeDecision('full', mode, 'mcp_search_unavailable')
+    return 'full'
+  }
+
+  if (messages && hasToolSearchExecutionFailure(messages)) {
+    logForDebugging(
+      'Tool search disabled after an execution failure; falling back to full schemas.',
+    )
+    logModeDecision('full', mode, 'tool_search_execution_failed')
+    return 'full'
+  }
+
+  const protocol = getToolSearchTransport(model)
+  if (protocol === 'local') {
+    logForDebugging(
+      `Tool search using provider-neutral local loading for model '${model}'.`,
+    )
   }
 
   switch (mode) {
     case 'tst':
-      logModeDecision(true, mode, 'tst_enabled')
-      return true
+      logModeDecision(protocol, mode, `${protocol}_enabled`)
+      return protocol
 
     case 'tst-auto': {
       const { enabled, debugDescription, metrics } = await checkAutoThreshold(
@@ -458,6 +606,7 @@ export async function isToolSearchEnabled(
         getToolPermissionContext,
         agents,
         model,
+        protocol,
       )
 
       if (enabled) {
@@ -465,19 +614,37 @@ export async function isToolSearchEnabled(
           `Auto tool search enabled: ${debugDescription}` +
             (source ? ` [source: ${source}]` : ''),
         )
-        logModeDecision(true, mode, 'auto_above_threshold', metrics)
-        return true
+        logModeDecision(protocol, mode, 'auto_above_threshold', metrics)
+        return protocol
       }
 
       logForDebugging(
         `Auto tool search disabled: ${debugDescription}` +
           (source ? ` [source: ${source}]` : ''),
       )
-      logModeDecision(false, mode, 'auto_below_threshold', metrics)
-      return false
+      logModeDecision('full', mode, 'auto_below_threshold', metrics)
+      return 'full'
     }
-
   }
+}
+
+/** Backwards-compatible boolean check for callers that only need enabled/full. */
+export async function isToolSearchEnabled(
+  model: string,
+  tools: Tools,
+  getToolPermissionContext: () => Promise<ToolPermissionContext>,
+  agents: AgentDefinition[],
+  source?: string,
+): Promise<boolean> {
+  return (
+    (await resolveToolSearchProtocol(
+      model,
+      tools,
+      getToolPermissionContext,
+      agents,
+      source,
+    )) !== 'full'
+  )
 }
 
 /**
@@ -506,53 +673,137 @@ function isToolReferenceWithName(
   )
 }
 
-/**
- * Type representing a tool_result block with array content.
- * Used for extracting tool_reference blocks from ToolSearchTool results.
- */
-type ToolResultBlock = {
-  type: 'tool_result'
-  content: unknown[]
+const LOCAL_TOOL_SEARCH_RESULT_TAG = 'cybercode-local-tool-search'
+
+export function formatLocalToolSearchResult(
+  toolNames: readonly string[],
+): string {
+  const names = [...new Set(toolNames)].sort()
+  return (
+    `Loaded deferred tools for the next request: ${names.join(', ')}. ` +
+    `Call them normally once their schemas appear.\n` +
+    `<${LOCAL_TOOL_SEARCH_RESULT_TAG}>${jsonStringify({ tools: names })}</${LOCAL_TOOL_SEARCH_RESULT_TAG}>`
+  )
 }
 
-/**
- * Type guard for tool_result blocks with array content.
- */
-function isToolResultBlockWithContent(obj: unknown): obj is ToolResultBlock {
+function extractLocalToolSearchNames(text: string): string[] {
+  const pattern = new RegExp(
+    `<${LOCAL_TOOL_SEARCH_RESULT_TAG}>([\\s\\S]*?)<\\/${LOCAL_TOOL_SEARCH_RESULT_TAG}>`,
+    'g',
+  )
+  const names: string[] = []
+  for (const match of text.matchAll(pattern)) {
+    try {
+      const parsed = JSON.parse(match[1]!) as { tools?: unknown }
+      if (!Array.isArray(parsed.tools)) continue
+      for (const name of parsed.tools) {
+        if (typeof name === 'string' && name.length > 0) names.push(name)
+      }
+    } catch {
+      // Ignore malformed markers; they cannot safely restore loading state.
+    }
+  }
+  return names
+}
+
+type ToolResultBlock = {
+  type: 'tool_result'
+  tool_use_id?: unknown
+  content?: unknown
+  is_error?: unknown
+}
+
+function isToolResultBlock(obj: unknown): obj is ToolResultBlock {
   return (
     typeof obj === 'object' &&
     obj !== null &&
     'type' in obj &&
-    (obj as { type: unknown }).type === 'tool_result' &&
-    'content' in obj &&
-    Array.isArray((obj as { content: unknown }).content)
+    (obj as { type: unknown }).type === 'tool_result'
   )
 }
 
+/** A failed ToolSearch turn falls back to full schemas instead of retrying forever. */
+export function hasToolSearchExecutionFailure(messages: Message[]): boolean {
+  const toolSearchUseIds = new Set<string>()
+  for (const msg of messages) {
+    if (msg.type !== 'assistant') continue
+    for (const block of msg.message.content) {
+      if (
+        block.type === 'tool_use' &&
+        toolMatchesName({ name: block.name }, TOOL_SEARCH_TOOL_NAME)
+      ) {
+        toolSearchUseIds.add(block.id)
+      }
+    }
+  }
+
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
+    const msg = messages[messageIndex]!
+    if (msg.type !== 'user' || !Array.isArray(msg.message?.content)) continue
+    for (let blockIndex = msg.message.content.length - 1; blockIndex >= 0; blockIndex--) {
+      const block = msg.message.content[blockIndex]
+      if (
+        isToolResultBlock(block) &&
+        typeof block.tool_use_id === 'string' &&
+        toolSearchUseIds.has(block.tool_use_id)
+      ) {
+        return block.is_error === true
+      }
+    }
+  }
+
+  return false
+}
+
+export type ToolSearchDiscoveryState = {
+  discoveredToolNames: Set<string>
+  /** Tools whose native tool_reference is no longer present in history. */
+  requiresEagerSchema: Set<string>
+}
+
 /**
- * Extract tool names from tool_reference blocks in message history.
+ * Extract loaded-tool state from native references, local markers, and compact
+ * boundaries in message history.
  *
  * When dynamic tool loading is enabled, MCP tools are not predeclared in the
- * tools array. Instead, they are discovered via ToolSearchTool which returns
- * tool_reference blocks. This function scans the message history to find all
- * tool names that have been referenced, so we can include only those tools
- * in subsequent API requests.
+ * tools array. Native Anthropic requests return tool_reference blocks; the
+ * provider-neutral protocol returns an ordinary text marker. Both forms are
+ * persisted in the transcript so model switches and session restores retain
+ * the same loaded set.
  *
  * This approach:
  * - Eliminates the need to predeclare all MCP tools upfront
  * - Removes limits on total quantity of MCP tools
  *
- * Compaction replaces tool_reference-bearing messages with a summary, so it
+ * Compaction replaces discovery messages with a summary, so it
  * snapshots the discovered set onto compactMetadata.preCompactDiscoveredTools
- * on the boundary marker; this scan reads it back. Snip instead protects the
- * tool_reference-carrying messages from removal.
+ * on the boundary marker; this scan reads it back.
  *
- * @param messages Array of messages that may contain tool_result blocks with tool_reference content
- * @returns Set of tool names that have been discovered via tool_reference blocks
+ * Local markers and compact boundaries require an ordinary schema when the
+ * next request uses the native protocol: defer_loading cannot expand a tool
+ * without a corresponding tool_reference in the API-visible history.
  */
-export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
+export function extractToolSearchDiscoveryState(
+  messages: Message[],
+): ToolSearchDiscoveryState {
   const discoveredTools = new Set<string>()
+  const requiresEagerSchema = new Set<string>()
+  const localToolSearchUseIds = new Set<string>()
   let carriedFromBoundary = 0
+
+  // Local markers are ordinary text, so bind them to an actual ToolSearch
+  // tool_use ID instead of trusting marker-shaped text from arbitrary tools.
+  for (const msg of messages) {
+    if (msg.type !== 'assistant') continue
+    for (const block of msg.message.content) {
+      if (
+        block.type === 'tool_use' &&
+        toolMatchesName({ name: block.name }, TOOL_SEARCH_TOOL_NAME)
+      ) {
+        localToolSearchUseIds.add(block.id)
+      }
+    }
+  }
 
   for (const msg of messages) {
     // Compact boundary carries the pre-compact discovered set. Inline type
@@ -561,7 +812,10 @@ export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
     if (msg.type === 'system' && msg.subtype === 'compact_boundary') {
       const carried = msg.compactMetadata?.preCompactDiscoveredTools
       if (carried) {
-        for (const name of carried) discoveredTools.add(name)
+        for (const name of carried) {
+          discoveredTools.add(name)
+          requiresEagerSchema.add(name)
+        }
         carriedFromBoundary += carried.length
       }
       continue
@@ -574,14 +828,42 @@ export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
     if (!Array.isArray(content)) continue
 
     for (const block of content) {
-      // tool_reference blocks only appear inside tool_result content, specifically
-      // in results from ToolSearchTool. The API expands these references into full
-      // tool definitions in the model's context.
-      if (isToolResultBlockWithContent(block)) {
+      if (!isToolResultBlock(block)) continue
+
+      if (Array.isArray(block.content)) {
         for (const item of block.content) {
           if (isToolReferenceWithName(item)) {
             discoveredTools.add(item.tool_name)
           }
+        }
+      }
+
+      if (
+        typeof block.tool_use_id !== 'string' ||
+        !localToolSearchUseIds.has(block.tool_use_id)
+      ) {
+        continue
+      }
+
+      const textBlocks =
+        typeof block.content === 'string'
+          ? [block.content]
+          : Array.isArray(block.content)
+            ? block.content.flatMap(item =>
+                typeof item === 'object' &&
+                item !== null &&
+                'type' in item &&
+                item.type === 'text' &&
+                'text' in item &&
+                typeof item.text === 'string'
+                  ? [item.text]
+                  : [],
+              )
+            : []
+      for (const text of textBlocks) {
+        for (const name of extractLocalToolSearchNames(text)) {
+          discoveredTools.add(name)
+          requiresEagerSchema.add(name)
         }
       }
     }
@@ -596,7 +878,12 @@ export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
     )
   }
 
-  return discoveredTools
+  return { discoveredToolNames: discoveredTools, requiresEagerSchema }
+}
+
+/** Return every tool loaded by either dynamic-loading protocol. */
+export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
+  return extractToolSearchDiscoveryState(messages).discoveredToolNames
 }
 
 export type DeferredToolsDelta = {
@@ -655,6 +942,7 @@ export function getDeferredToolsDelta(
   tools: Tools,
   messages: Message[],
   scanContext?: DeferredToolsDeltaScanContext,
+  protocol: ToolSearchProtocol = 'native',
 ): DeferredToolsDelta | null {
   const announced = new Set<string>()
   let attachmentCount = 0
@@ -670,7 +958,9 @@ export function getDeferredToolsDelta(
     for (const n of msg.attachment.removedNames) announced.delete(n)
   }
 
-  const deferred: Tool[] = tools.filter(isDeferredTool)
+  const deferred: Tool[] = tools.filter(tool =>
+    isToolDeferredForProtocol(tool, protocol),
+  )
   const deferredNames = new Set(deferred.map(t => t.name))
   const poolNames = new Set(tools.map(t => t.name))
 
@@ -722,6 +1012,7 @@ async function checkAutoThreshold(
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
   agents: AgentDefinition[],
   model: string,
+  protocol: ActiveToolSearchProtocol,
 ): Promise<{
   enabled: boolean
   debugDescription: string
@@ -733,6 +1024,7 @@ async function checkAutoThreshold(
     getToolPermissionContext,
     agents,
     model,
+    protocol,
   )
 
   if (deferredToolTokens !== null) {
@@ -752,6 +1044,7 @@ async function checkAutoThreshold(
       tools,
       getToolPermissionContext,
       agents,
+      protocol,
     )
   const charThreshold = getAutoToolSearchCharThreshold(model)
   return {

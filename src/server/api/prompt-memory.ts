@@ -52,6 +52,7 @@ export async function handlePromptMemoryApi(
       return Response.json(buildPromptMemoryInsights({
         files: {
           user: status.files.user,
+          project: status.files.project,
           brief: status.files.brief,
         },
         logs,

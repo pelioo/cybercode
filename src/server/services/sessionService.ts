@@ -208,6 +208,17 @@ type RawEntry = {
   [key: string]: unknown
 }
 
+type TranscriptCacheEntry = {
+  size: number
+  mtimeMs: number
+  ctimeMs: number
+  dev: number
+  ino: number
+  tailGuard: Buffer
+  entries: RawEntry[]
+  messages: MessageEntry[]
+}
+
 function isTranscriptUserTurnBoundary(entry: RawEntry): boolean {
   if (
     entry.type !== 'user' ||
@@ -396,12 +407,16 @@ export class SessionService {
    *  path. Full hits require size+mtime match; append-only growth is handled
    *  by tail-parsing just the new bytes, so live sessions being actively
    *  written still get near-instant seeks. */
-  private transcriptMessageCache = new Map<string, { size: number; mtimeMs: number; entries: RawEntry[]; messages: MessageEntry[] }>()
+  private transcriptMessageCache = new Map<string, TranscriptCacheEntry>()
+  private transcriptMessageLoads = new Map<string, Promise<TranscriptCacheEntry>>()
+  private transcriptCacheGenerations = new Map<string, number>()
   /** Per-subagent-file message cache, keyed by file path, validated by
    *  size+mtime. Subagent caches survive main-transcript growth, so
    *  appendSubagentToolMessages costs ~0ms when agents are idle. */
   private subagentMessagesCache = new Map<string, { size: number; mtimeMs: number; messages: MessageEntry[] }>()
   private static readonly TRANSCRIPT_CACHE_LIMIT = 30
+  private static readonly TRANSCRIPT_CACHE_MAX_BYTES = 64 * 1024 * 1024
+  private transcriptCacheBytes = 0
 
   private getConfigDir(): string {
     return getClaudeConfigHomeDir()
@@ -419,13 +434,120 @@ export class SessionService {
     return sanitizePortablePath(dirPath)
   }
 
-  private touchTranscriptCache(filePath: string, value: { size: number; mtimeMs: number; entries: RawEntry[]; messages: MessageEntry[] }) {
+  private touchTranscriptCache(filePath: string, value: TranscriptCacheEntry) {
+    const previous = this.transcriptMessageCache.get(filePath)
+    if (previous) this.transcriptCacheBytes -= previous.size
     this.transcriptMessageCache.delete(filePath)
     this.transcriptMessageCache.set(filePath, value)
-    if (this.transcriptMessageCache.size > SessionService.TRANSCRIPT_CACHE_LIMIT) {
+    this.transcriptCacheBytes += value.size
+    while (
+      this.transcriptMessageCache.size > SessionService.TRANSCRIPT_CACHE_LIMIT
+      || this.transcriptCacheBytes > SessionService.TRANSCRIPT_CACHE_MAX_BYTES
+    ) {
       const oldest = this.transcriptMessageCache.keys().next().value
-      if (typeof oldest === 'string') this.transcriptMessageCache.delete(oldest)
+      if (typeof oldest !== 'string') break
+      const evicted = this.transcriptMessageCache.get(oldest)
+      if (evicted) this.transcriptCacheBytes -= evicted.size
+      this.transcriptMessageCache.delete(oldest)
     }
+  }
+
+  private invalidateTranscriptCache(...filePaths: string[]) {
+    for (const filePath of filePaths) {
+      const cached = this.transcriptMessageCache.get(filePath)
+      if (cached) this.transcriptCacheBytes -= cached.size
+      this.transcriptMessageCache.delete(filePath)
+      this.transcriptCacheGenerations.set(
+        filePath,
+        (this.transcriptCacheGenerations.get(filePath) ?? 0) + 1,
+      )
+    }
+  }
+
+  private async readTranscriptTailGuard(filePath: string, size: number): Promise<Buffer> {
+    const length = Math.min(size, 4096)
+    if (length <= 0) return Buffer.alloc(0)
+
+    const handle = await fs.open(filePath, 'r')
+    try {
+      const buffer = Buffer.alloc(length)
+      const { bytesRead } = await handle.read(buffer, 0, length, size - length)
+      return bytesRead === length ? buffer : buffer.subarray(0, bytesRead)
+    } finally {
+      await handle.close()
+    }
+  }
+
+  private async loadParsedTranscriptSnapshot(
+    filePath: string,
+    generation: number,
+  ): Promise<TranscriptCacheEntry> {
+    const cacheValue = (value: TranscriptCacheEntry) => {
+      if ((this.transcriptCacheGenerations.get(filePath) ?? 0) === generation) {
+        this.touchTranscriptCache(filePath, value)
+      }
+      return value
+    }
+    const stat = await fs.stat(filePath)
+    const cached = this.transcriptMessageCache.get(filePath)
+    const sameFile = cached?.dev === stat.dev && cached?.ino === stat.ino
+    if (
+      cached
+      && sameFile
+      && cached.mtimeMs === stat.mtimeMs
+      && cached.ctimeMs === stat.ctimeMs
+      && cached.size === stat.size
+    ) {
+      return cacheValue(cached)
+    }
+
+    // A larger size is not sufficient evidence of an append: another process
+    // may have replaced the whole file with a larger transcript. Verify both
+    // file identity and the bytes immediately before the cached boundary.
+    if (
+      cached
+      && sameFile
+      && stat.size > cached.size
+      && cached.mtimeMs <= stat.mtimeMs
+      && cached.ctimeMs <= stat.ctimeMs
+      && (cached.tailGuard.length === 0 || cached.tailGuard[cached.tailGuard.length - 1] === 0x0a)
+    ) {
+      const boundaryGuard = await this.readTranscriptTailGuard(filePath, cached.size)
+      if (boundaryGuard.equals(cached.tailGuard)) {
+        const tailEntries = await this.readJsonlTail(filePath, cached.size, stat.size)
+        const entries = [...cached.entries, ...tailEntries]
+        const messages = this.entriesToMessages(entries)
+        const value: TranscriptCacheEntry = {
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          ctimeMs: stat.ctimeMs,
+          dev: stat.dev,
+          ino: stat.ino,
+          tailGuard: await this.readTranscriptTailGuard(filePath, stat.size),
+          entries,
+          messages,
+        }
+        return cacheValue(value)
+      }
+    }
+
+    // Bind the parsed bytes to the stat snapshot above. If another process
+    // appends while this read is in progress, the next lookup can safely read
+    // only the new tail instead of caching entries beyond `stat.size` under an
+    // older boundary and duplicating them later.
+    const entries = await this.readJsonlFile(filePath, stat.size)
+    const messages = this.entriesToMessages(entries)
+    const value: TranscriptCacheEntry = {
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+      dev: stat.dev,
+      ino: stat.ino,
+      tailGuard: await this.readTranscriptTailGuard(filePath, stat.size),
+      entries,
+      messages,
+    }
+    return cacheValue(value)
   }
 
   /**
@@ -434,54 +556,79 @@ export class SessionService {
    * The subagent injection is NOT included here — it stays per-call with its
    * own per-subagent-file cache so in-flight agents are never stale.
    */
+  private async getParsedTranscriptSnapshot(filePath: string): Promise<TranscriptCacheEntry> {
+    const inFlight = this.transcriptMessageLoads.get(filePath)
+    if (inFlight) {
+      await inFlight
+      return this.getParsedTranscriptSnapshot(filePath)
+    }
+
+    const generation = this.transcriptCacheGenerations.get(filePath) ?? 0
+    let request: Promise<TranscriptCacheEntry>
+    request = this.loadParsedTranscriptSnapshot(filePath, generation).finally(() => {
+      if (this.transcriptMessageLoads.get(filePath) === request) {
+        this.transcriptMessageLoads.delete(filePath)
+      }
+    })
+    this.transcriptMessageLoads.set(filePath, request)
+    const result = await request
+    if ((this.transcriptCacheGenerations.get(filePath) ?? 0) !== generation) {
+      return this.getParsedTranscriptSnapshot(filePath)
+    }
+    return result
+  }
+
   private async getParsedTranscriptMessages(filePath: string): Promise<MessageEntry[]> {
-    const stat = await fs.stat(filePath)
-    const cached = this.transcriptMessageCache.get(filePath)
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-      this.touchTranscriptCache(filePath, cached)
-      return cached.messages
-    }
-
-    // Append-only growth: parse just the tail beyond the previous file size.
-    if (cached && stat.size >= cached.size && cached.mtimeMs <= stat.mtimeMs) {
-      const tailEntries = await this.readJsonlTail(filePath, cached.size)
-      const entries = [...cached.entries, ...tailEntries]
-      const messages = this.entriesToMessages(entries)
-      this.touchTranscriptCache(filePath, { size: stat.size, mtimeMs: stat.mtimeMs, entries, messages })
-      return messages
-    }
-
-    const entries = await this.readJsonlFile(filePath)
-    const messages = this.entriesToMessages(entries)
-    this.touchTranscriptCache(filePath, { size: stat.size, mtimeMs: stat.mtimeMs, entries, messages })
-    return messages
+    return (await this.getParsedTranscriptSnapshot(filePath)).messages
   }
 
   // --------------------------------------------------------------------------
   // JSONL parsing
   // --------------------------------------------------------------------------
 
-  private async readJsonlFile(filePath: string): Promise<RawEntry[]> {
-    let content: string
+  private async readJsonlFile(filePath: string, maxBytes?: number): Promise<RawEntry[]> {
+    if (maxBytes === undefined) {
+      let content: string
+      try {
+        content = await fs.readFile(filePath, 'utf-8')
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          return []
+        }
+        throw err
+      }
+
+      return this.parseJsonlEntries(content)
+    }
+
+    let handle: fs.FileHandle | null = null
     try {
-      content = await fs.readFile(filePath, 'utf-8')
+      handle = await fs.open(filePath, 'r')
+      const buffer = Buffer.alloc(maxBytes)
+      let bytesRead = 0
+      while (bytesRead < maxBytes) {
+        const result = await handle.read(buffer, bytesRead, maxBytes - bytesRead, bytesRead)
+        if (result.bytesRead === 0) break
+        bytesRead += result.bytesRead
+      }
+      return this.parseJsonlEntries(buffer.subarray(0, bytesRead).toString('utf-8'))
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         return []
       }
       throw err
+    } finally {
+      await handle?.close()
     }
-
-    return this.parseJsonlEntries(content)
   }
 
   /** Read and parse only the bytes appended after `offset` (line-aligned). */
-  private async readJsonlTail(filePath: string, offset: number): Promise<RawEntry[]> {
+  private async readJsonlTail(filePath: string, offset: number, endOffset?: number): Promise<RawEntry[]> {
     let handle: fs.FileHandle | null = null
     try {
       handle = await fs.open(filePath, 'r')
       const stat = await handle.stat()
-      const length = stat.size - offset
+      const length = Math.min(stat.size, endOffset ?? stat.size) - offset
       if (length <= 0) return []
       const buffer = Buffer.alloc(length)
       await handle.read(buffer, 0, length, offset)
@@ -1492,7 +1639,7 @@ export class SessionService {
     const found = await this.findSessionFile(sessionId, locator)
     if (!found) return null
 
-    const entries = await this.readJsonlFile(found.filePath)
+    const { entries } = await this.getParsedTranscriptSnapshot(found.filePath)
     const metadata: TranscriptMetadataSnapshot = {}
 
     for (let i = entries.length - 1; i >= 0; i--) {
@@ -1516,7 +1663,7 @@ export class SessionService {
     const found = await this.findSessionFile(sessionId, locator)
     if (!found) return null
 
-    const entries = await this.readJsonlFile(found.filePath)
+    const { entries } = await this.getParsedTranscriptSnapshot(found.filePath)
     const { latestRequest, latestTurnUsage } = summarizeTranscriptUsage(entries)
     if (!latestRequest) return null
 
@@ -1570,7 +1717,7 @@ export class SessionService {
     const found = await this.findSessionFile(sessionId, locator)
     if (!found) return null
 
-    const entries = await this.readJsonlFile(found.filePath)
+    const { entries } = await this.getParsedTranscriptSnapshot(found.filePath)
     const { records } = summarizeTranscriptUsage(entries)
     const models = new Map<string, TranscriptUsageSnapshot['models'][number]>()
     let totalCostUSD = 0
@@ -1787,7 +1934,7 @@ export class SessionService {
     for (const { filePath, projectDir, sessionId } of sessionFiles) {
       try {
         const stat = await fs.stat(filePath)
-        const entries = await this.readJsonlFile(filePath)
+        const { entries } = await this.getParsedTranscriptSnapshot(filePath)
         const workDir = this.resolveWorkDirFromEntries(entries, projectDir)
         const workDirExists = await this.pathExists(workDir)
         const isTemporary = this.resolveIsTemporaryFromEntries(entries)
@@ -1823,6 +1970,11 @@ export class SessionService {
         })
       } catch {
         // Skip unreadable files
+      } finally {
+        // Listing sessions must not monopolize the server while large JSONL
+        // files are parsed. Yield between files so foreground history requests
+        // from a session switch can be served immediately.
+        await new Promise<void>((resolve) => setImmediate(resolve))
       }
     }
 
@@ -1846,12 +1998,12 @@ export class SessionService {
 
     const { filePath, projectDir } = found
     const stat = await fs.stat(filePath)
-    const entries = await this.readJsonlFile(filePath)
+    const { entries, messages: cachedMessages } = await this.getParsedTranscriptSnapshot(filePath)
 
     const messages = await this.appendSubagentToolMessages(
       projectDir,
       sessionId,
-      this.entriesToMessages(entries),
+      cachedMessages,
     )
     const title = this.extractTitle(entries)
     const lastMessage = this.extractLastMessage(entries)
@@ -2136,7 +2288,7 @@ export class SessionService {
       throw ApiError.notFound(`Session not found: ${sourceSessionId}`)
     }
 
-    const sourceEntries = await this.readJsonlFile(found.filePath)
+    const { entries: sourceEntries } = await this.getParsedTranscriptSnapshot(found.filePath)
     const mainEntries = sourceEntries.filter((entry) => this.isMainTranscriptEntry(entry))
     const targetIndex = mainEntries.findIndex((entry) => entry.uuid === targetAssistantMessageId)
     if (targetIndex < 0) {
@@ -2269,6 +2421,7 @@ export class SessionService {
         { encoding: 'utf-8', mode: 0o600 },
       )
       await fs.rename(temporaryFilePath, filePath)
+      this.invalidateTranscriptCache(filePath)
     } catch (error) {
       await fs.rm(temporaryFilePath, { force: true }).catch(() => {})
       throw error
@@ -2303,8 +2456,11 @@ export class SessionService {
       throw ApiError.notFound(`Session not found: ${sessionId}`)
     }
 
-    await fs.rm(this.activeSessionFilePath(found.filePath), { force: true })
-    await fs.rm(this.placeholderBackupPath(found.filePath), { force: true }).catch(() => {})
+    const activePath = this.activeSessionFilePath(found.filePath)
+    const placeholderPath = this.placeholderBackupPath(found.filePath)
+    await fs.rm(activePath, { force: true })
+    await fs.rm(placeholderPath, { force: true }).catch(() => {})
+    this.invalidateTranscriptCache(found.filePath, activePath, placeholderPath)
     await fs.rm(path.join(this.getProjectsDir(), found.projectDir, sessionId), {
       recursive: true,
       force: true,
@@ -2362,7 +2518,7 @@ export class SessionService {
     const found = await this.findSessionFile(sessionId, locator)
     if (!found) return null
 
-    const entries = await this.readJsonlFile(found.filePath)
+    const { entries } = await this.getParsedTranscriptSnapshot(found.filePath)
     return this.resolveWorkDirFromEntries(entries, found.projectDir)
   }
 
@@ -2374,7 +2530,7 @@ export class SessionService {
     const found = await this.findSessionFile(sessionId)
     if (!found) return null
 
-    const entries = await this.readJsonlFile(found.filePath)
+    const { entries } = await this.getParsedTranscriptSnapshot(found.filePath)
     const workDir = this.resolveWorkDirFromEntries(entries, found.projectDir) || process.cwd()
     const isTemporary = this.resolveIsTemporaryFromEntries(entries)
     let customTitle: string | null = null
@@ -2406,8 +2562,11 @@ export class SessionService {
   async deleteSessionFile(sessionId: string): Promise<void> {
     const found = await this.findSessionFile(sessionId)
     if (!found) return
-    await fs.rm(this.activeSessionFilePath(found.filePath), { force: true })
-    await fs.rm(this.placeholderBackupPath(found.filePath), { force: true })
+    const activePath = this.activeSessionFilePath(found.filePath)
+    const backupPath = this.placeholderBackupPath(found.filePath)
+    await fs.rm(activePath, { force: true })
+    await fs.rm(backupPath, { force: true })
+    this.invalidateTranscriptCache(found.filePath, activePath, backupPath)
   }
 
   async moveSessionFileAsideForLaunch(sessionId: string): Promise<void> {
@@ -2419,6 +2578,7 @@ export class SessionService {
 
     await fs.rm(backupPath, { force: true }).catch(() => {})
     await fs.rename(activePath, backupPath)
+    this.invalidateTranscriptCache(activePath, backupPath)
   }
 
   async clearSessionTranscript(sessionId: string, fallbackWorkDir?: string): Promise<void> {
@@ -2436,7 +2596,12 @@ export class SessionService {
       throw ApiError.notFound(`Session not found: ${sessionId}`)
     }
 
-    const entries = await this.readJsonlFile(found.filePath)
+    const entries = await this.getParsedTranscriptSnapshot(found.filePath)
+      .then((snapshot) => snapshot.entries)
+      .catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+        throw error
+      })
     const workDir = this.resolveWorkDirFromEntries(entries, found.projectDir) || fallbackWorkDir || process.cwd()
     let isTemporary = this.resolveIsTemporaryFromEntries(entries)
     const placeholderPath = this.placeholderBackupPath(found.filePath)
@@ -2474,6 +2639,7 @@ export class SessionService {
       `${JSON.stringify(initialEntry)}\n${JSON.stringify(metaEntry)}\n`,
       'utf-8',
     )
+    this.invalidateTranscriptCache(found.filePath)
   }
 
   async appendSessionMetadata(
@@ -2530,6 +2696,7 @@ export class SessionService {
       } else {
         try {
           await fs.rename(found.filePath, activePath)
+          this.invalidateTranscriptCache(found.filePath, activePath)
         } catch (err: unknown) {
           if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
         }
@@ -2566,7 +2733,7 @@ export class SessionService {
       throw ApiError.notFound(`Session not found: ${sessionId}`)
     }
 
-    const entries = await this.readJsonlFile(found.filePath)
+    const { entries } = await this.getParsedTranscriptSnapshot(found.filePath)
     const activeMessages = this.entriesToMessages(entries)
     const startIndex = activeMessages.findIndex((message) => message.id === startMessageId)
 
@@ -2592,6 +2759,7 @@ export class SessionService {
         ? filteredEntries.map((entry) => JSON.stringify(entry)).join('\n') + '\n'
         : ''
     await fs.writeFile(found.filePath, content, 'utf-8')
+    this.invalidateTranscriptCache(found.filePath)
 
     return {
       removedCount: removedMessageIds.length,
@@ -2608,7 +2776,7 @@ export class SessionService {
       throw ApiError.notFound(`Session not found: ${sessionId}`)
     }
 
-    const entries = await this.readJsonlFile(found.filePath)
+    const { entries } = await this.getParsedTranscriptSnapshot(found.filePath)
     const snapshotsByMessageId = new Map<string, FileHistorySnapshot>()
 
     for (const entry of entries) {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { randomUUID } from 'crypto'
 import { mkdir, readFile, rm, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import {
   getSessionId,
   regenerateSessionId,
@@ -15,6 +15,7 @@ import {
 } from '../utils/envUtils.js'
 import {
   BRIEF_CHAR_LIMIT,
+  PROJECT_EXPERIENCE_CHAR_LIMIT,
   SOUL_CHAR_LIMIT,
   USER_PROMPT_MEMORY_CHAR_LIMIT,
 } from './budget.js'
@@ -26,9 +27,11 @@ import {
 import {
   clearPromptMemorySnapshotForTesting,
   loadPromptMemory,
+  loadPromptMemoryPolicyContribution,
 } from './loadPromptMemory.js'
 import {
   appendPromptMemoryAutoReviewLogs,
+  buildGlobalPromptMemoryReviewPrompt,
   buildPromptMemoryAutoReviewPrompt,
   extractPromptMemoryAutoReviewLogs,
   formatPromptMemoryAutoReviewNotice,
@@ -46,11 +49,13 @@ import {
 } from './autoReview.js'
 import {
   getBriefPath,
+  getProjectExperiencePath,
   getPromptMemoryConfigPath,
   getPromptMemoryDir,
   getSoulPath,
   getUserPromptMemoryPath,
 } from './paths.js'
+import { collectProjectExperienceCorpus } from './projectCorpus.js'
 import {
   buildPromptMemoryInsights,
   parsePromptMemoryInsight,
@@ -68,6 +73,12 @@ import {
 import { PromptMemoryTool } from '../tools/PromptMemoryTool/PromptMemoryTool.js'
 import { PROMPT as PROMPT_MEMORY_TOOL_PROMPT } from '../tools/PromptMemoryTool/prompt.js'
 import { fetchSystemPromptParts } from '../utils/queryContext.js'
+import { buildReadOnlyMemoryPrompt } from '../memdir/memdir.js'
+import { getAutoMemPath } from '../memdir/paths.js'
+import { getAllBaseTools } from '../tools.js'
+import { buildExtractAssistantDailyLogPrompt } from '../services/extractMemories/prompts.js'
+
+const LEGACY_STATIC_POLICY_CHARACTER_COUNT = 11_899
 
 describe('prompt memory', () => {
   let tmpRoot: string
@@ -95,6 +106,7 @@ describe('prompt memory', () => {
     delete process.env.CLAUDE_CONFIG_DIR
 
     _setConfigHomeDirHomeForTesting(tmpHome)
+    getAutoMemPath.cache.clear()
     clearPromptMemorySnapshotForTesting()
     resetPromptMemoryAutoReviewForTesting()
     regenerateSessionId()
@@ -119,6 +131,7 @@ describe('prompt memory', () => {
 
     _setConfigHomeDirHomeForTesting(undefined)
     _resetConfigHomeDirForTesting()
+    getAutoMemPath.cache.clear()
     await rm(tmpRoot, { recursive: true, force: true })
   })
 
@@ -129,6 +142,12 @@ describe('prompt memory', () => {
     )
     expect(getBriefPath()).toBe(
       join(tmpHome, '.cyber', 'prompt-memory', 'BRIEF.md'),
+    )
+    expect(getProjectExperiencePath()).toStartWith(
+      join(tmpHome, '.cyber', 'projects'),
+    )
+    expect(getProjectExperiencePath()).toEndWith(
+      join('memory', 'PROJECT_EXPERIENCE.md'),
     )
     expect(getUserPromptMemoryPath()).toBe(
       join(tmpHome, '.cyber', 'prompt-memory', 'USER.md'),
@@ -173,6 +192,12 @@ describe('prompt memory', () => {
     ).toBe('identity')
     expect(
       parsePromptMemoryInsight(
+        'Keep the route selector state local to this repository.',
+        'project',
+      ).category,
+    ).toBe('project-method')
+    expect(
+      parsePromptMemoryInsight(
         'Always run focused tests before the production build.',
         'brief',
       ).category,
@@ -188,6 +213,11 @@ describe('prompt memory', () => {
             '[quality] User expects tests and a production build before delivery.',
           ],
         },
+        project: {
+          entries: [
+            '[decision] Keep route selection in the desktop settings store.',
+          ],
+        },
         brief: {
           entries: [
             '[meta-method] Discuss ambiguous product behavior before implementation.',
@@ -195,6 +225,13 @@ describe('prompt memory', () => {
         },
       },
       logs: [
+        {
+          timestamp: '2026-07-11T00:00:30.000Z',
+          trigger: 'interval',
+          target: 'project',
+          changed: true,
+          content: '[decision] Keep route selection in the desktop settings store.',
+        },
         {
           timestamp: '2026-07-11T00:00:00.000Z',
           trigger: 'explicit',
@@ -213,12 +250,21 @@ describe('prompt memory', () => {
     })
 
     expect(overview.stats).toEqual({
-      total: 3,
+      total: 4,
       user: 2,
-      methods: 1,
-      dimensions: 3,
-      automaticUpdates: 2,
+      project: 1,
+      globalMethods: 1,
+      methods: 2,
+      dimensions: 4,
+      automaticUpdates: 3,
     })
+    expect(overview.insights).toContainEqual(
+      expect.objectContaining({
+        category: 'decision',
+        target: 'project',
+        source: 'observed',
+      }),
+    )
     expect(overview.insights).toContainEqual(
       expect.objectContaining({
         category: 'communication',
@@ -262,37 +308,76 @@ describe('prompt memory', () => {
     await expect(readFile(getSoulPath(), 'utf-8')).resolves.toBe(customSoul)
   })
 
-  test('loads soul, brief, and user as one prompt section', async () => {
+  test('separates durable user context from communication and execution policy', async () => {
     await mkdir(getPromptMemoryDir(), { recursive: true })
+    await mkdir(dirname(getProjectExperiencePath()), { recursive: true })
     await writeFile(getSoulPath(), 'You are CyberCode with a calm style.')
-    await writeFile(getBriefPath(), '- Use Bun for this project.')
-    await writeFile(getUserPromptMemoryPath(), '- User prefers Chinese.')
+    await writeFile(getBriefPath(), '- Verify risky changes before delivery.')
+    await writeFile(getProjectExperiencePath(), '- Use Bun for this project.')
+    await writeFile(
+      getUserPromptMemoryPath(),
+      [
+        '[identity] User calls CyberCode Zero.',
+        '[communication] Reply in concise Chinese.',
+        '[workflow] Run an end-to-end check before delivery.',
+      ].join(PROMPT_MEMORY_ENTRY_DELIMITER),
+    )
 
-    const prompt = await loadPromptMemory()
+    const [prompt, policyContribution] = await Promise.all([
+      loadPromptMemory(),
+      loadPromptMemoryPolicyContribution(),
+    ])
 
     expect(prompt).toContain('# CyberCode Soul')
     expect(prompt).toContain('You are CyberCode with a calm style.')
-    expect(prompt).toContain('# Prompt Memory')
-    expect(prompt).toContain('## Brief')
+    expect(prompt).toContain('# Evolution Memory')
+    expect(prompt).toContain('read-only snapshot')
+    expect(prompt).toContain('## Global Methods')
+    expect(prompt).toContain('- Verify risky changes before delivery.')
+    expect(prompt).toContain('## Current Project Experience')
     expect(prompt).toContain('- Use Bun for this project.')
     expect(prompt).toContain('## User')
-    expect(prompt).toContain('- User prefers Chinese.')
+    expect(prompt).toContain('[identity] User calls CyberCode Zero.')
+    expect(prompt).not.toContain('Reply in concise Chinese.')
+    expect(prompt).not.toContain('Run an end-to-end check before delivery.')
+    expect(policyContribution).toEqual({
+      source: 'user-memory',
+      label: 'User memory',
+      communication: {
+        instructions: ['Reply in concise Chinese.'],
+      },
+      execution: {
+        instructions: ['Run an end-to-end check before delivery.'],
+      },
+    })
   })
 
-  test('can pause BRIEF and USER injection without disabling SOUL or deleting memory', async () => {
+  test('can pause all evolution-memory injection without disabling SOUL or deleting memory', async () => {
     await mkdir(getPromptMemoryDir(), { recursive: true })
+    await mkdir(dirname(getProjectExperiencePath()), { recursive: true })
     await writeFile(getSoulPath(), 'You are CyberCode with a calm style.')
-    await writeFile(getBriefPath(), '- Use Bun for this project.')
+    await writeFile(getBriefPath(), '- Verify risky changes before delivery.')
+    await writeFile(getProjectExperiencePath(), '- Use Bun for this project.')
     await writeFile(getUserPromptMemoryPath(), '- User prefers Chinese.')
     await updatePromptMemoryConfig({ injectEvolutionMemory: false })
 
-    const prompt = await loadPromptMemory()
+    const [prompt, policyContribution] = await Promise.all([
+      loadPromptMemory(),
+      loadPromptMemoryPolicyContribution(),
+    ])
 
     expect(prompt).toContain('# CyberCode Soul')
-    expect(prompt).not.toContain('# Prompt Memory')
+    expect(prompt).not.toContain('# Evolution Memory')
     expect(prompt).not.toContain('- Use Bun for this project.')
+    expect(prompt).not.toContain('- Verify risky changes before delivery.')
     expect(prompt).not.toContain('- User prefers Chinese.')
-    await expect(readFile(getBriefPath(), 'utf-8')).resolves.toContain('Use Bun')
+    expect(policyContribution).toBeNull()
+    await expect(readFile(getBriefPath(), 'utf-8')).resolves.toContain(
+      'Verify risky changes',
+    )
+    await expect(readFile(getProjectExperiencePath(), 'utf-8')).resolves.toContain(
+      'Use Bun',
+    )
     await expect(readFile(getUserPromptMemoryPath(), 'utf-8')).resolves.toContain(
       'prefers Chinese',
     )
@@ -315,9 +400,59 @@ describe('prompt memory', () => {
 
     expect(prompt).toContain('# CyberCode Soul')
     expect(prompt).toContain('CyberCode is named 零.')
-    expect(prompt).toContain('# Prompt Memory')
+    expect(prompt).toContain('# Evolution Memory')
     expect(prompt).toContain('Prefer Bun for local scripts.')
     expect(prompt).toContain('User prefers Chinese replies.')
+  })
+
+  test('assembles one canonical engineering and communication rulebook', async () => {
+    const originalApiKey = process.env.ANTHROPIC_API_KEY
+    process.env.ANTHROPIC_API_KEY = 'prompt-assembly-test-key'
+    try {
+      await mkdir(getPromptMemoryDir(), { recursive: true })
+      await writeFile(
+        getUserPromptMemoryPath(),
+        [
+          '[communication] Reply in concise Chinese.',
+          '[workflow] Run an end-to-end check before delivery.',
+        ].join(PROMPT_MEMORY_ENTRY_DELIMITER),
+      )
+      const { defaultSystemPrompt } = await fetchSystemPromptParts({
+        tools: [],
+        mainLoopModel: 'claude-test',
+        additionalWorkingDirectories: [],
+        mcpClients: [],
+      })
+      const prompt = defaultSystemPrompt.join('\n\n')
+      const dynamicBoundaryIndex = defaultSystemPrompt.indexOf(
+        '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__',
+      )
+      const staticPolicy = defaultSystemPrompt
+        .slice(2, dynamicBoundaryIndex)
+        .join('\n\n')
+
+      expect(dynamicBoundaryIndex).toBeGreaterThan(2)
+      expect(staticPolicy.length).toBeLessThan(
+        LEGACY_STATIC_POLICY_CHARACTER_COUNT,
+      )
+      expect(prompt.match(/^# Engineering Execution$/gm)).toHaveLength(1)
+      expect(prompt.match(/^# Communication$/gm)).toHaveLength(1)
+      expect(prompt.match(/^# Active Policy Overrides$/gm)).toHaveLength(1)
+      expect(prompt.match(/Reply in concise Chinese\./g)).toHaveLength(1)
+      expect(
+        prompt.match(/Run an end-to-end check before delivery\./g),
+      ).toHaveLength(1)
+      expect(prompt).not.toContain('# Agent Work Rules')
+      expect(prompt).not.toContain('# Tone and style')
+      expect(prompt).not.toContain('# Output efficiency')
+      expect(prompt).not.toContain('Length limits:')
+      expect(prompt).not.toContain(
+        'the original tool result may be cleared later',
+      )
+    } finally {
+      if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY
+      else process.env.ANTHROPIC_API_KEY = originalApiKey
+    }
   })
 
   test('freezes prompt memory for the active session', async () => {
@@ -339,8 +474,13 @@ describe('prompt memory', () => {
 
   test('bounds prompt memory file sizes', async () => {
     await mkdir(getPromptMemoryDir(), { recursive: true })
+    await mkdir(dirname(getProjectExperiencePath()), { recursive: true })
     await writeFile(getSoulPath(), 's'.repeat(SOUL_CHAR_LIMIT + 100))
     await writeFile(getBriefPath(), 'b'.repeat(BRIEF_CHAR_LIMIT + 100))
+    await writeFile(
+      getProjectExperiencePath(),
+      'p'.repeat(PROJECT_EXPERIENCE_CHAR_LIMIT + 100),
+    )
     await writeFile(
       getUserPromptMemoryPath(),
       'u'.repeat(USER_PROMPT_MEMORY_CHAR_LIMIT + 100),
@@ -350,9 +490,14 @@ describe('prompt memory', () => {
 
     expect(prompt).toContain('Truncated SOUL.md')
     expect(prompt).toContain('Truncated BRIEF.md')
+    expect(prompt).toContain('Truncated PROJECT_EXPERIENCE.md')
     expect(prompt).toContain('Truncated USER.md')
     expect(prompt!.length).toBeLessThan(
-      SOUL_CHAR_LIMIT + BRIEF_CHAR_LIMIT + USER_PROMPT_MEMORY_CHAR_LIMIT + 800,
+      SOUL_CHAR_LIMIT +
+        BRIEF_CHAR_LIMIT +
+        PROJECT_EXPERIENCE_CHAR_LIMIT +
+        USER_PROMPT_MEMORY_CHAR_LIMIT +
+        1_000,
     )
   })
 
@@ -380,6 +525,20 @@ describe('prompt memory', () => {
 
     const removed = await removePromptMemoryEntry('user', 'prefers Chinese')
     expect(removed.entries).toEqual(['User likes concise Chinese replies.'])
+  })
+
+  test('stores current-project experience outside global prompt memory', async () => {
+    const result = await addPromptMemoryEntry(
+      'project',
+      '[project-method] Keep provider state in the settings store.',
+    )
+
+    expect(result.changed).toBe(true)
+    expect(result.path).toBe(getProjectExperiencePath())
+    await expect(
+      readFile(getProjectExperiencePath(), 'utf-8'),
+    ).resolves.toContain('[project-method]')
+    await expect(readFile(getBriefPath(), 'utf-8')).rejects.toThrow()
   })
 
   test('prefers an exact entry match over another entry that contains it', async () => {
@@ -594,102 +753,234 @@ describe('prompt memory', () => {
     })
   })
 
-  test('upgrades every fifth periodic review to a conservative meta review', () => {
+  test('schedules global distillation every five periodic reviews with reusable project evidence', () => {
     let state = {
-      version: 1 as const,
-      periodicReviewsSinceMeta: 0,
+      version: 2 as const,
+      periodicReviewsSinceGlobal: 0,
     }
 
     for (let review = 1; review <= 4; review++) {
       const plan = planPromptMemoryReview({
-        trigger: 'interval',
         state,
-        memoryEntryCount: 3,
+        periodicReview: true,
+        projectCount: 1,
+        projectEntryCount: 3,
+        corpusFingerprint: 'corpus-v1',
         now: `2026-07-${String(review).padStart(2, '0')}T00:00:00.000Z`,
       })
-      expect(plan.trigger).toBe('interval')
-      expect(plan.nextState.periodicReviewsSinceMeta).toBe(review)
+      expect(plan.runGlobalReview).toBe(false)
+      expect(plan.nextState.periodicReviewsSinceGlobal).toBe(review)
       state = plan.nextState
     }
 
-    const metaPlan = planPromptMemoryReview({
-      trigger: 'interval',
+    const globalPlan = planPromptMemoryReview({
       state,
-      memoryEntryCount: 3,
+      periodicReview: true,
+      projectCount: 1,
+      projectEntryCount: 3,
+      corpusFingerprint: 'corpus-v1',
       now: '2026-07-05T00:00:00.000Z',
     })
-    expect(metaPlan.trigger).toBe('meta')
-    expect(metaPlan.nextState.periodicReviewsSinceMeta).toBe(0)
-    expect(metaPlan.nextState.lastMetaReviewAt).toBe(
+    expect(globalPlan.runGlobalReview).toBe(true)
+    expect(globalPlan.nextState.periodicReviewsSinceGlobal).toBe(0)
+    expect(globalPlan.nextState.lastGlobalCorpusFingerprint).toBe('corpus-v1')
+    expect(globalPlan.nextState.lastGlobalReviewAt).toBe(
       '2026-07-05T00:00:00.000Z',
     )
 
-    const insufficientEvidence = planPromptMemoryReview({
-      trigger: 'interval',
+    const missingProjectEvidence = planPromptMemoryReview({
       state,
-      memoryEntryCount: 2,
+      periodicReview: true,
+      projectCount: 0,
+      projectEntryCount: 8,
+      corpusFingerprint: 'corpus-v1',
       now: '2026-07-06T00:00:00.000Z',
     })
-    expect(insufficientEvidence.trigger).toBe('interval')
-    expect(insufficientEvidence.nextState.periodicReviewsSinceMeta).toBe(5)
+    expect(missingProjectEvidence.runGlobalReview).toBe(false)
+    expect(missingProjectEvidence.nextState.periodicReviewsSinceGlobal).toBe(5)
+
+    const explicitReview = planPromptMemoryReview({
+      state: {
+        version: 2,
+        periodicReviewsSinceGlobal: 2,
+      },
+      periodicReview: false,
+      projectCount: 4,
+      projectEntryCount: 20,
+      corpusFingerprint: 'corpus-v1',
+    })
+    expect(explicitReview.nextState.periodicReviewsSinceGlobal).toBe(2)
+
+    const unchangedCorpus = planPromptMemoryReview({
+      state: {
+        version: 2,
+        periodicReviewsSinceGlobal: 5,
+        lastGlobalCorpusFingerprint: 'corpus-v1',
+      },
+      periodicReview: true,
+      projectCount: 4,
+      projectEntryCount: 20,
+      corpusFingerprint: 'corpus-v1',
+    })
+    expect(unchangedCorpus.runGlobalReview).toBe(false)
+    expect(unchangedCorpus.nextState.periodicReviewsSinceGlobal).toBe(5)
   })
 
-  test('persists the meta-review cadence across restarts', async () => {
+  test('persists the global-review cadence and migrates the legacy state', async () => {
     await writePromptMemoryAutoReviewState({
-      version: 1,
-      periodicReviewsSinceMeta: 4,
+      version: 2,
+      periodicReviewsSinceGlobal: 4,
       lastReviewAt: '2026-07-04T00:00:00.000Z',
     })
 
     expect(await readPromptMemoryAutoReviewState()).toEqual({
-      version: 1,
-      periodicReviewsSinceMeta: 4,
+      version: 2,
+      periodicReviewsSinceGlobal: 4,
       lastReviewAt: '2026-07-04T00:00:00.000Z',
+    })
+
+    await writeFile(
+      promptMemoryAutoReviewPathsForTesting.getAutoReviewStatePath(),
+      JSON.stringify({
+        version: 1,
+        periodicReviewsSinceMeta: 3,
+        lastMetaReviewAt: '2026-06-01T00:00:00.000Z',
+      }),
+    )
+    expect(await readPromptMemoryAutoReviewState()).toEqual({
+      version: 2,
+      periodicReviewsSinceGlobal: 3,
+      lastGlobalReviewAt: '2026-06-01T00:00:00.000Z',
     })
   })
 
-  test('builds an automatic review prompt that forbids SOUL writes', () => {
+  test('builds an ordinary background review prompt limited to project and user memory', () => {
     const prompt = buildPromptMemoryAutoReviewPrompt({
       newMessageCount: 2,
       trigger: 'explicit',
-      briefEntries: ['Use Bun for local scripts.'],
+      briefEntries: ['[meta-method] Verify risky changes before delivery.'],
+      projectEntries: ['[environment] Use Bun for local scripts.'],
       userEntries: ['User prefers Chinese.'],
       preferredLanguage: 'Chinese',
     })
 
     expect(prompt).toContain('PromptMemory tool')
-    expect(prompt).toContain('Allowed targets: brief, user.')
-    expect(prompt).toContain('Never write or modify SOUL.md')
+    expect(prompt).toContain('Allowed targets: project, user.')
+    expect(prompt).toContain('Never write or modify SOUL.md or BRIEF.md')
+    expect(prompt).toContain('BRIEF.md (global methods, read-only')
+    expect(prompt).toContain('PROJECT_EXPERIENCE.md')
     expect(prompt).toContain('Basic user relationship facts')
     expect(prompt).toContain('save that in USER.md')
-    expect(prompt).toContain('[meta-method]')
+    expect(prompt).toContain('[project-method]')
+    expect(prompt).toContain('Never promote a lesson directly to BRIEF.md')
     expect(prompt).toContain('at least two consistent examples')
     expect(prompt).toContain('Do not infer personality')
     expect(prompt).toContain('User prefers Chinese.')
     expect(prompt).toContain('human-readable body')
     expect(prompt).toContain('Simplified Chinese')
     expect(prompt).toContain('semantic category tag in English')
+    expect(prompt).toContain('generic concise or direct preference')
   })
 
-  test('builds a meta-review prompt that consolidates supported patterns', () => {
-    const prompt = buildPromptMemoryAutoReviewPrompt({
-      newMessageCount: 12,
-      trigger: 'meta',
+  test('builds an isolated global prompt that accepts one project corpus', () => {
+    const prompt = buildGlobalPromptMemoryReviewPrompt({
+      corpus: {
+        projects: [
+          {
+            projectKey: 'alpha',
+            path: '/memory/alpha/PROJECT_EXPERIENCE.md',
+            entries: [
+              '[lesson] Run focused tests after shared-state changes.',
+              '[decision] Verify the production build after UI changes.',
+              '[project-method] Check shared-state behavior before release.',
+            ],
+            updatedAtMs: 2,
+          },
+        ],
+        projectCount: 1,
+        entryCount: 3,
+        content: '## Project 1\n1. Run focused tests.\n2. Verify the build.\n3. Check shared-state behavior.',
+        fingerprint: 'corpus-v1',
+      },
       briefEntries: [
-        '[lesson] Run focused tests after editing shared state.',
-        '[lesson] Verify the production build after UI changes.',
-      ],
-      userEntries: [
-        '[quality] User expects verification before delivery.',
+        '[meta-method] Preserve a focused verification loop.',
       ],
       preferredLanguage: 'Chinese',
     })
 
-    expect(prompt).toContain('low-frequency meta-consolidation review')
-    expect(prompt).toContain('review the current prompt-memory entries as one system')
-    expect(prompt).toContain('Meta-consolidation rules:')
-    expect(prompt).toContain('at least two existing entries')
-    expect(prompt).toContain('more general, more actionable, and shorter')
+    expect(prompt).toContain('cross-project experience distiller')
+    expect(prompt).toContain('only allowed target is brief')
+    expect(prompt).toContain('A single project may support a [meta-method]')
+    expect(prompt).toContain('stricter abstraction check')
+    expect(prompt).toContain('Do not use recent conversation text')
+    expect(prompt).toContain('[meta-method]')
+    expect(prompt).toContain('## Project 1')
+    expect(prompt).toContain('Project labels are anonymous')
+  })
+
+  test('collects bounded project experience from distinct repositories', async () => {
+    const currentPath = getProjectExperiencePath()
+    const otherPath = join(
+      tmpHome,
+      '.cyber',
+      'projects',
+      'other-repository',
+      'memory',
+      'PROJECT_EXPERIENCE.md',
+    )
+    await mkdir(dirname(currentPath), { recursive: true })
+    await mkdir(dirname(otherPath), { recursive: true })
+    await writeFile(
+      currentPath,
+      formatPromptMemoryEntries([
+        '[lesson] Verify shared-state changes with a focused test.',
+        '[decision] Keep provider state in one store.',
+        '[environment] Local checkout lives at /private/project/path.',
+      ]),
+    )
+    await writeFile(
+      otherPath,
+      formatPromptMemoryEntries([
+        '[lesson] Verify shared-state changes with a focused test.',
+      ]),
+    )
+
+    const corpus = await collectProjectExperienceCorpus()
+
+    expect(corpus.projectCount).toBe(2)
+    expect(corpus.entryCount).toBe(3)
+    expect(corpus.fingerprint).toHaveLength(64)
+    expect(corpus.content).toContain('## Project 1')
+    expect(corpus.content).not.toContain('other-repository')
+    expect(corpus.content).not.toContain('/private/project/path')
+    expect(corpus.content).toContain('Verify shared-state changes')
+  })
+
+  test('keeps persistent-memory writes out of the main agent', () => {
+    const prompt = buildReadOnlyMemoryPrompt({
+      memoryDirs: ['/tmp/cyber-memory'],
+    })
+
+    expect(prompt).toContain('read-only, potentially stale task context')
+    expect(prompt).toContain('asynchronous memory maintenance')
+    expect(prompt.length).toBeLessThan(400)
+    expect(prompt).not.toContain('How to save memories')
+    expect(getAllBaseTools().map(tool => tool.name)).not.toContain(
+      'PromptMemory',
+    )
+  })
+
+  test('moves KAIROS daily-log write instructions into the background worker', () => {
+    const prompt = buildExtractAssistantDailyLogPrompt(
+      4,
+      '',
+      '/tmp/cyber-memory/logs/2026/08/2026-08-09.md',
+    )
+
+    expect(prompt).toContain('memory extraction subagent')
+    expect(prompt).toContain('long-lived assistant session')
+    expect(prompt).toContain('/tmp/cyber-memory/logs/2026/08/2026-08-09.md')
+    expect(prompt).toContain('Do not edit MEMORY.md')
   })
 
   test('normalizes supported UI languages for automatic memory writing', () => {
@@ -723,6 +1014,8 @@ describe('prompt memory', () => {
       'Do not say "I wrote it to memory"',
     )
     expect(PROMPT_MEMORY_TOOL_PROMPT).toContain('[meta-method]')
+    expect(PROMPT_MEMORY_TOOL_PROMPT).toContain('PROJECT_EXPERIENCE.md')
+    expect(PROMPT_MEMORY_TOOL_PROMPT).toContain('One project may provide enough evidence')
     expect(PROMPT_MEMORY_TOOL_PROMPT).toContain('implicit preferences need repeated')
 
     const result = await PromptMemoryTool.call({
@@ -804,10 +1097,21 @@ describe('prompt memory', () => {
         timestamp: '2026-06-10T00:01:00.000Z',
         sessionId: 's1',
         trigger: 'interval',
-        target: 'brief',
+        target: 'project',
         action: 'add',
         changed: true,
         content: 'Use Bun for local scripts.',
+        message: 'Entry added.',
+      },
+      {
+        id: 'three',
+        timestamp: '2026-06-10T00:02:00.000Z',
+        sessionId: 's1',
+        trigger: 'meta',
+        target: 'brief',
+        action: 'add',
+        changed: true,
+        content: 'Verify risky changes before delivery.',
         message: 'Entry added.',
       },
     ]
@@ -816,7 +1120,7 @@ describe('prompt memory', () => {
 
     const logs = await readPromptMemoryAutoReviewLogs(1)
     expect(logs).toHaveLength(1)
-    expect(logs[0]!.id).toBe('two')
+    expect(logs[0]!.id).toBe('three')
   })
 
   test('formats a compact auto-review notice for changed prompt memory', () => {
@@ -837,16 +1141,27 @@ describe('prompt memory', () => {
         timestamp: '2026-06-10T00:01:00.000Z',
         sessionId: 's1',
         trigger: 'interval',
-        target: 'brief',
+        target: 'project',
         action: 'add',
         changed: true,
         content: 'Use Bun for local scripts.',
         message: 'Entry added.',
       },
+      {
+        id: 'three',
+        timestamp: '2026-06-10T00:02:00.000Z',
+        sessionId: 's1',
+        trigger: 'meta',
+        target: 'brief',
+        action: 'add',
+        changed: true,
+        content: 'Verify risky changes before delivery.',
+        message: 'Entry added.',
+      },
     ])
 
     expect(notice).toBe(
-      '自进化记忆已更新：对你的了解 / 做事方法，将在新会话生效。可在「记忆」中查看和修改。',
+      '自进化记忆已更新：对你的了解 / 项目经验 / 全局方法，将在新会话生效。可在「记忆」中查看和修改。',
     )
     expect(formatPromptMemoryAutoReviewNotice([])).toBeNull()
   })

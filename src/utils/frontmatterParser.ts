@@ -50,6 +50,10 @@ export type FrontmatterData = {
   // When set, the skill is only activated when the model touches matching files
   // Uses the same format as CLAUDE.md paths frontmatter
   paths?: string | string[] | null
+  // Instruction-memory selectors. `sessions` matches the active CyberCode
+  // instruction profile; `projects` matches the current project directory.
+  sessions?: string | string[] | null
+  projects?: string | string[] | null
   // Shell to use for !`cmd` and ```! blocks in skill/command .md content.
   // 'bash' (default) or 'powershell'. File-scoped — applies to all !-blocks.
   // Never consults settings.defaultShell: skills are portable across platforms,

@@ -78,6 +78,12 @@ type PendingAnchorJump = {
   ready: boolean
 }
 
+const ANCHOR_JUMP_MIN_SETTLE_MS = 160
+const ANCHOR_JUMP_MAX_SETTLE_MS = 800
+const ANCHOR_JUMP_LAYOUT_QUIET_MS = 96
+const ANCHOR_JUMP_STABLE_FRAMES = 3
+const ANCHOR_JUMP_TOLERANCE_PX = 1
+
 function appendChildToolCall(
   childToolCallsByParent: Map<string, ToolCall[]>,
   parentToolUseId: string,
@@ -123,6 +129,15 @@ function getAnchorPreview(content: string): string {
     .replace(/^(?:#{1,6}\s+|[-*>]\s+)/, '')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+function getUserQuestionAnchorPreview(content: string): string {
+  const stripped = content
+    .replace(/<system-reminder>[\s\S]*?(<\/system-reminder>|$)/g, '')
+    .trim()
+  if (!stripped) return ''
+  if (/^<(task-notification|command-message|local-command)/.test(stripped)) return ''
+  return getAnchorPreview(content)
 }
 
 export function buildRenderModel(messages: UIMessage[]): RenderModel {
@@ -426,6 +441,7 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
   const stopGeneration = useChatStore((s) => s.stopGeneration)
   const reloadHistory = useChatStore((s) => s.reloadHistory)
   const loadHistory = useChatStore((s) => s.loadHistory)
+  const loadAnchors = useChatStore((s) => s.loadAnchors)
   const queueComposerPrefill = useChatStore((s) => s.queueComposerPrefill)
   const completeStreamingReveal = useChatStore((s) => s.completeStreamingReveal)
   const isMemberSession = useTeamStore((s) =>
@@ -441,6 +457,7 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
   const isAssistantTurnActive = chatState !== 'idle' || Boolean(visualStreamingText)
   const agentTaskNotifications = sessionState?.agentTaskNotifications ?? {}
   const historyLoadState = sessionState?.historyLoadState ?? 'idle'
+  const anchorsLoaded = sessionState?.anchorsLoaded ?? false
   const allMessagesLoaded = sessionState?.allMessagesLoaded ?? false
   const loadMoreHistory = useChatStore((s) => s.loadMoreHistory)
   const loadMoreRecent = useChatStore((s) => s.loadMoreRecent)
@@ -487,6 +504,34 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
       void loadHistory(resolvedSessionId, projectPath)
     }
   }, [isActive, resolvedSessionId, projectPath, historyLoadState, loadHistory])
+
+  // A cached transcript can already be loaded while its full-session anchor
+  // snapshot is still cold (for example after restoring a tab). Start that
+  // local read in the background, but keep the rail hidden until it settles.
+  useEffect(() => {
+    if (
+      !isActive
+      || isMemberSession
+      || !resolvedSessionId
+      || historyLoadState !== 'loaded'
+      || anchorsLoaded
+    ) return
+    // Full-session anchors can scan a very large local JSONL file. Let the
+    // visible history paint first, and cancel this cold read when the user is
+    // rapidly moving through sessions.
+    const timer = window.setTimeout(() => {
+      void loadAnchors(resolvedSessionId, projectPath)
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [
+    anchorsLoaded,
+    historyLoadState,
+    isActive,
+    isMemberSession,
+    loadAnchors,
+    projectPath,
+    resolvedSessionId,
+  ])
 
   const renderModel = useMemo(
     () => buildRenderModel(messages),
@@ -564,6 +609,30 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
     }
     return -1
   }, [renderItems])
+  const rewindMetrics = useMemo(() => {
+    const totalRewindableUsers = renderItems.reduce((count, item) => (
+      item.kind === 'message'
+      && item.message.type === 'user_text'
+      && !item.message.pending
+        ? count + 1
+        : count
+    ), 0)
+    let userIndex = 0
+    return renderItems.map((item) => {
+      if (
+        item.kind !== 'message'
+        || item.message.type !== 'user_text'
+        || item.message.pending
+      ) return null
+
+      const metric = {
+        index: userIndex,
+        offsetFromEnd: totalRewindableUsers - userIndex - 1,
+      }
+      userIndex += 1
+      return metric
+    })
+  }, [renderItems])
   const renderItemsLengthRef = useRef(renderItems.length)
   renderItemsLengthRef.current = renderItems.length
   const renderItemsRef = useRef(renderItems)
@@ -576,16 +645,31 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
     // Locate every loaded user question inside renderItems.
     const indexById = new Map<string, number>()
     const answerPreviewById = new Map<string, string>()
+    const loadedUserQuestions: Array<{
+      id: string
+      serverId?: string
+      itemIndex: number
+      preview: string
+    }> = []
     let currentUserIds: string[] = []
     renderItems.forEach((item, index) => {
       if (item.kind !== 'message') return
       if (item.message.type === 'user_text') {
+        const preview = getUserQuestionAnchorPreview(item.message.content)
         currentUserIds = [item.message.id]
         if (!indexById.has(item.message.id)) indexById.set(item.message.id, index)
         const serverId = item.message.serverId
         if (serverId) {
           currentUserIds.push(serverId)
           if (!indexById.has(serverId)) indexById.set(serverId, index)
+        }
+        if (preview) {
+          loadedUserQuestions.push({
+            id: item.message.id,
+            serverId,
+            itemIndex: index,
+            preview,
+          })
         }
         return
       }
@@ -605,17 +689,53 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
       // Server-provided full-history anchors (source of truth, filtered on the
       // server). Anchors outside the loaded window get itemIndex null and
       // render dimmed; clicking them loads history first.
-      return sessionAnchors.map((anchor) => {
+      const representedLocalIds = new Set<string>()
+      const mapped = sessionAnchors.map((anchor, anchorIndex) => {
         const itemIndex = indexById.get(anchor.messageId) ?? null
+        let optimisticMatch: (typeof loadedUserQuestions)[number] | undefined
+        if (itemIndex === null && anchorIndex === sessionAnchors.length - 1) {
+          for (let index = loadedUserQuestions.length - 1; index >= 0; index -= 1) {
+            const question = loadedUserQuestions[index]
+            if (
+              question
+              && !question.serverId
+              && question.preview === anchor.preview
+              && !representedLocalIds.has(question.id)
+            ) {
+              optimisticMatch = question
+              break
+            }
+          }
+        }
+        if (optimisticMatch) representedLocalIds.add(optimisticMatch.id)
+        const displayId = optimisticMatch?.id ?? anchor.messageId
         return {
           seq: anchor.seq,
-          id: anchor.messageId,
+          id: displayId,
+          ...(optimisticMatch ? { loadId: anchor.messageId } : {}),
           preview: anchor.preview,
-          answerPreview: answerPreviewById.get(anchor.messageId) ?? anchor.answerPreview,
-          itemIndex,
-          loaded: itemIndex !== null,
+          answerPreview: answerPreviewById.get(displayId)
+            ?? answerPreviewById.get(anchor.messageId)
+            ?? anchor.answerPreview,
+          itemIndex: optimisticMatch?.itemIndex ?? itemIndex,
+          loaded: optimisticMatch !== undefined || itemIndex !== null,
         }
       })
+
+      const representedServerIds = new Set(sessionAnchors.map((anchor) => anchor.messageId))
+      for (const question of loadedUserQuestions) {
+        if (representedLocalIds.has(question.id)) continue
+        if (question.serverId && representedServerIds.has(question.serverId)) continue
+        mapped.push({
+          seq: mapped.length,
+          id: question.serverId ?? question.id,
+          preview: question.preview,
+          answerPreview: answerPreviewById.get(question.serverId ?? question.id),
+          itemIndex: question.itemIndex,
+          loaded: true,
+        })
+      }
+      return mapped
     }
 
     // Fallback until the server anchor list arrives: derive from the loaded
@@ -625,15 +745,7 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
     const anchors: MessageAnchor[] = []
     renderItems.forEach((item, index) => {
       if (item.kind === 'message' && item.message.type === 'user_text') {
-        const stripped = item.message.content
-          .replace(/<system-reminder>[\s\S]*?(<\/system-reminder>|$)/g, '')
-          .trim()
-        if (!stripped) return
-        if (/^<(task-notification|command-message|local-command)/.test(stripped)) return
-        const firstLine = stripped
-          .split('\n')
-          .map((line) => line.trim())
-          .find((line) => line && !line.startsWith('<')) ?? ''
+        const firstLine = getUserQuestionAnchorPreview(item.message.content)
         if (!firstLine) return
         anchors.push({
           seq: anchors.length,
@@ -662,6 +774,20 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
   const anchorVisibleRangeRef = useRef<{ start: number; end: number } | null>(null)
   // While an anchor jump is in flight, don't let loadMoreRecent slide the window.
   const anchorJumpSuppressFollowRef = useRef(false)
+  const anchorJumpSettleCleanupRef = useRef<(() => void) | null>(null)
+  const anchorJumpInteractionCleanupRef = useRef<(() => void) | null>(null)
+
+  const clearAnchorJumpEffects = useCallback((releaseFollow: boolean) => {
+    anchorJumpSettleCleanupRef.current?.()
+    anchorJumpInteractionCleanupRef.current?.()
+    if (releaseFollow) anchorJumpSuppressFollowRef.current = false
+  }, [])
+
+  const completeAnchorJump = useCallback((requestId: number, anchorId: string) => {
+    if (anchorJumpRequestRef.current !== requestId) return
+    setPendingAnchorJump((current) => current?.requestId === requestId ? null : current)
+    setAnchorLoadingId((current) => current === anchorId ? null : current)
+  }, [])
 
   // Position within the chat scroller directly. WebKit can ignore
   // scrollIntoView() for deep descendants while a large React commit is still
@@ -704,17 +830,57 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
     // away from the jump target. Only a deliberate user scroll re-enables it
     // (wheel / touch / scrollbar drag / keyboard all count).
     anchorJumpSuppressFollowRef.current = true
-    const release = () => {
-      anchorJumpSuppressFollowRef.current = false
+    const previousScrollBehavior = scroller.style.scrollBehavior
+    const previousOverflowAnchor = scroller.style.getPropertyValue('overflow-anchor')
+    scroller.style.scrollBehavior = 'auto'
+    scroller.style.setProperty('overflow-anchor', 'none')
+
+    let settleRaf: number | null = null
+    let resizeObserver: ResizeObserver | null = null
+    const cleanupSettlement = () => {
+      if (settleRaf !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(settleRaf)
+        settleRaf = null
+      }
+      resizeObserver?.disconnect()
+      resizeObserver = null
+      scroller.style.scrollBehavior = previousScrollBehavior
+      if (previousOverflowAnchor) {
+        scroller.style.setProperty('overflow-anchor', previousOverflowAnchor)
+      } else {
+        scroller.style.removeProperty('overflow-anchor')
+      }
+      if (anchorJumpSettleCleanupRef.current === cleanupSettlement) {
+        anchorJumpSettleCleanupRef.current = null
+      }
     }
-    scroller.addEventListener('wheel', release, { once: true })
-    scroller.addEventListener('touchmove', release, { once: true })
-    scroller.addEventListener('pointerdown', release, { once: true })
-    scroller.addEventListener('keydown', release, { once: true })
+    anchorJumpSettleCleanupRef.current = cleanupSettlement
+
+    const cleanupInteractionListeners = () => {
+      scroller.removeEventListener('wheel', releaseToUser)
+      scroller.removeEventListener('touchmove', releaseToUser)
+      scroller.removeEventListener('pointerdown', releaseToUser)
+      scroller.removeEventListener('keydown', releaseToUser)
+      if (anchorJumpInteractionCleanupRef.current === cleanupInteractionListeners) {
+        anchorJumpInteractionCleanupRef.current = null
+      }
+    }
+    const releaseToUser = () => {
+      cleanupSettlement()
+      cleanupInteractionListeners()
+      anchorJumpSuppressFollowRef.current = false
+      completeAnchorJump(requestId, anchorId)
+    }
+    anchorJumpInteractionCleanupRef.current = cleanupInteractionListeners
+    scroller.addEventListener('wheel', releaseToUser, { once: true })
+    scroller.addEventListener('touchmove', releaseToUser, { once: true })
+    scroller.addEventListener('pointerdown', releaseToUser, { once: true })
+    scroller.addEventListener('keydown', releaseToUser, { once: true })
+
     const applyPosition = () => {
-      if (anchorJumpRequestRef.current !== requestId) return false
+      if (anchorJumpRequestRef.current !== requestId) return null
       const currentTarget = findTargetElement()
-      if (!currentTarget) return false
+      if (!currentTarget) return null
       const scrollerRect = scroller.getBoundingClientRect()
       const targetRect = currentTarget.getBoundingClientRect()
       if (
@@ -722,48 +888,95 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
         || !Number.isFinite(targetRect.top)
         || !Number.isFinite(targetRect.height)
       ) {
-        return false
+        return null
       }
       const targetTop = scroller.scrollTop + targetRect.top - scrollerRect.top
       const centeredTop = targetTop - Math.max(0, (scroller.clientHeight - targetRect.height) / 2)
       const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight)
       const nextScrollTop = Math.min(Math.max(0, centeredTop), maxScrollTop)
       scroller.scrollTop = nextScrollTop
-      return true
+      return Math.abs(scroller.scrollTop - nextScrollTop)
     }
 
-    if (!applyPosition()) return false
-
-    // WKWebView can ignore the first scroll write while a large transcript is
-    // committing. Re-resolve by stable message id on the next two frames so a
-    // single click still lands after layout and scroll anchoring settle.
-    if (typeof requestAnimationFrame === 'function') {
-      requestAnimationFrame(() => {
-        if (!applyPosition()) return
-        requestAnimationFrame(() => { applyPosition() })
-      })
+    if (applyPosition() === null) {
+      cleanupSettlement()
+      cleanupInteractionListeners()
+      return false
     }
 
     const target = renderItemsRef.current.find((item) => renderItemMatchesAnchorId(item, anchorId))
     if (target?.kind === 'message' && target.message.type === 'user_text') {
       setAnchorBubbleHighlight({ messageId: target.message.id, token: requestId })
     }
+
+    // A long WKWebView transcript can keep changing measured height after the
+    // click has fired. Two frame retries are not enough: native scroll
+    // anchoring may restore the previous viewport afterwards. Keep resolving
+    // the stable message id and re-centering briefly, then hand control back as
+    // soon as layout is quiet. Any deliberate user interaction cancels this.
+    if (typeof requestAnimationFrame !== 'function') {
+      cleanupSettlement()
+      completeAnchorJump(requestId, anchorId)
+      return true
+    }
+
+    const now = () => typeof performance !== 'undefined' ? performance.now() : Date.now()
+    const startedAt = now()
+    let lastLayoutChangeAt = startedAt
+    let stableFrames = 0
+
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => {
+        lastLayoutChangeAt = now()
+        stableFrames = 0
+      })
+      resizeObserver.observe(scrollContentElementRef.current ?? el)
+    }
+
+    const settle = () => {
+      settleRaf = null
+      if (anchorJumpRequestRef.current !== requestId) {
+        cleanupSettlement()
+        return
+      }
+
+      const delta = applyPosition()
+      stableFrames = delta !== null && delta <= ANCHOR_JUMP_TOLERANCE_PX
+        ? stableFrames + 1
+        : 0
+
+      const currentTime = now()
+      const elapsed = currentTime - startedAt
+      const layoutIsQuiet = currentTime - lastLayoutChangeAt >= ANCHOR_JUMP_LAYOUT_QUIET_MS
+      const settled = elapsed >= ANCHOR_JUMP_MIN_SETTLE_MS
+        && layoutIsQuiet
+        && stableFrames >= ANCHOR_JUMP_STABLE_FRAMES
+
+      if (settled || elapsed >= ANCHOR_JUMP_MAX_SETTLE_MS) {
+        cleanupSettlement()
+        completeAnchorJump(requestId, anchorId)
+        return
+      }
+      settleRaf = requestAnimationFrame(settle)
+    }
+    settleRaf = requestAnimationFrame(settle)
     return true
-  }, [])
+  }, [completeAnchorJump])
 
   const failAnchorJump = useCallback((requestId: number, anchorId: string) => {
     if (anchorJumpRequestRef.current !== requestId) return
-    anchorJumpSuppressFollowRef.current = false
+    clearAnchorJumpEffects(true)
     setPendingAnchorJump((current) => current?.requestId === requestId ? null : current)
     setAnchorLoadingId((current) => current === anchorId ? null : current)
     addToast({ type: 'error', message: t('chat.anchorJumpFailed') })
-  }, [addToast, t])
+  }, [addToast, clearAnchorJumpEffects, t])
 
   const handleAnchorJump = useCallback((anchor: MessageAnchor) => {
     const requestId = anchorJumpRequestRef.current + 1
     anchorJumpRequestRef.current = requestId
+    clearAnchorJumpEffects(false)
     setPendingAnchorJump(null)
-    setAnchorLoadingId(null)
+    setAnchorLoadingId(anchor.id)
 
     if (
       anchor.itemIndex !== null
@@ -790,7 +1003,7 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
       return
     }
 
-    void loadHistoryUntil(resolvedSessionId, anchor.id).then((found) => {
+    void loadHistoryUntil(resolvedSessionId, anchor.loadId ?? anchor.id).then((found) => {
       if (anchorJumpRequestRef.current !== requestId) return
       if (!found) {
         failAnchorJump(requestId, anchor.id)
@@ -802,18 +1015,35 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
     }).catch(() => {
       failAnchorJump(requestId, anchor.id)
     })
-  }, [failAnchorJump, resolvedSessionId, loadHistoryUntil, scrollToAnchorItem])
+  }, [clearAnchorJumpEffects, failAnchorJump, resolvedSessionId, loadHistoryUntil, scrollToAnchorItem])
 
   // The server anchor list is a transcript snapshot; refresh it (debounced)
   // when new local user questions appear that it does not cover yet.
-  const localUserQuestionCount = useMemo(
-    () => renderItems.filter((item) => item.kind === 'message' && item.message.type === 'user_text').length,
-    [renderItems],
-  )
+  const latestLocalUserAnchor = useMemo(() => {
+    for (let index = renderItems.length - 1; index >= 0; index -= 1) {
+      const item = renderItems[index]
+      if (item?.kind === 'message' && item.message.type === 'user_text') return item
+    }
+    return undefined
+  }, [renderItems])
   const anchorsRefreshTimerRef = useRef<number | null>(null)
+  const anchorsRefreshAttemptRef = useRef<string | null>(null)
   useEffect(() => {
     if (!resolvedSessionId || !sessionState?.anchorsLoaded) return
-    if ((sessionState.anchors?.length ?? 0) >= localUserQuestionCount) return
+    if (!latestLocalUserAnchor || latestLocalUserAnchor.kind !== 'message') return
+    const latestMessage = latestLocalUserAnchor.message
+    if (latestMessage.type !== 'user_text') return
+    const represented = Boolean(
+      latestMessage.serverId
+      && sessionState.anchors?.some((anchor) => anchor.messageId === latestMessage.serverId),
+    )
+    if (represented) {
+      anchorsRefreshAttemptRef.current = null
+      return
+    }
+    const refreshKey = `${resolvedSessionId}:${latestMessage.serverId ?? latestMessage.id}`
+    if (anchorsRefreshAttemptRef.current === refreshKey) return
+    anchorsRefreshAttemptRef.current = refreshKey
     if (anchorsRefreshTimerRef.current !== null) window.clearTimeout(anchorsRefreshTimerRef.current)
     const sessionId = resolvedSessionId
     anchorsRefreshTimerRef.current = window.setTimeout(() => {
@@ -823,7 +1053,7 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
     return () => {
       if (anchorsRefreshTimerRef.current !== null) window.clearTimeout(anchorsRefreshTimerRef.current)
     }
-  }, [localUserQuestionCount, resolvedSessionId, projectPath, sessionState?.anchorsLoaded, sessionState?.anchors])
+  }, [latestLocalUserAnchor, resolvedSessionId, projectPath, sessionState?.anchorsLoaded, sessionState?.anchors])
   const latestRenderItem = renderItems[renderItems.length - 1]
   const latestRenderItemKey = latestRenderItem
     ? `${listIdentity}:${getRenderItemId(latestRenderItem)}`
@@ -852,6 +1082,7 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
     isNearBottomRef.current = true
     activationBottomLockRef.current = true
     autoFollowCurrentTurnRef.current = false
+    anchorsRefreshAttemptRef.current = null
     setAnchorVisibleRange(null)
     anchorVisibleRangeRef.current = null
     setRenderChunkStart(Math.max(0, renderItems.length - INITIAL_RENDER_CHUNK))
@@ -869,6 +1100,18 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
     })
     return () => cancelAnimationFrame(raf)
   }, [renderChunkStart, listIdentity])
+
+  // Never expose a hit target before the corresponding transcript DOM is
+  // committed. This removes the short session-switch window where the bars
+  // looked available but their targets could not yet be resolved.
+  const anchorRailReady =
+    isActive
+    && renderItems.length > 0
+    && renderChunkStart === 0
+    && (
+      isMemberSession
+      || (historyLoadState === 'loaded' && anchorsLoaded)
+    )
 
   // Complete an anchor jump from the layout lifecycle that actually committed
   // the target node. This is reliable even when WKWebView needs substantially
@@ -893,12 +1136,6 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
       itemIndex,
       pendingAnchorJump.requestId,
     )) return
-    if (anchorJumpRequestRef.current !== pendingAnchorJump.requestId) return
-
-    setPendingAnchorJump((current) =>
-      current?.requestId === pendingAnchorJump.requestId ? null : current,
-    )
-    setAnchorLoadingId((current) => current === pendingAnchorJump.id ? null : current)
   }, [pendingAnchorJump, renderChunkStart, renderItems, scrollToAnchorItem])
 
   useEffect(() => {
@@ -912,11 +1149,15 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
 
   useEffect(() => {
     anchorJumpRequestRef.current += 1
+    clearAnchorJumpEffects(true)
     setPendingAnchorJump(null)
     setAnchorLoadingId(null)
     setAnchorBubbleHighlight(null)
-    anchorJumpSuppressFollowRef.current = false
-  }, [listIdentity])
+  }, [clearAnchorJumpEffects, listIdentity])
+
+  useEffect(() => () => {
+    clearAnchorJumpEffects(true)
+  }, [clearAnchorJumpEffects])
 
   useLayoutEffect(() => {
     const scroller = scrollerElementRef.current
@@ -1411,18 +1652,9 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
 
       const msg = item.message
       const isLiveAssistant = item.isStreaming && msg.type === 'assistant_text'
-      // Count user_text messages that appear before this one in chronological order.
-      const userMsgCount = renderItems
-        .slice(0, dataIndex)
-        .filter((i) => i.kind === 'message' && i.message.type === 'user_text' && !i.message.pending)
-        .length
-      const rewindableUserIndex = msg.type === 'user_text' && !msg.pending ? userMsgCount : null
-      const rewindableUserOffsetFromEnd = msg.type === 'user_text' && !msg.pending
-        ? renderItems
-            .slice(dataIndex + 1)
-            .filter((i) => i.kind === 'message' && i.message.type === 'user_text' && !i.message.pending)
-            .length
-        : null
+      const rewindMetric = rewindMetrics[dataIndex]
+      const rewindableUserIndex = rewindMetric?.index ?? null
+      const rewindableUserOffsetFromEnd = rewindMetric?.offsetFromEnd ?? null
 
       return (
         <div className="px-0 py-0">
@@ -1486,7 +1718,7 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
       )
     },
     [
-      renderItems,
+      rewindMetrics,
       anchorBubbleHighlight,
       toolResultMap,
       childToolCallsByParent,
@@ -1616,7 +1848,7 @@ export function MessageList({ sessionId, projectPath, isActive = true, bottomOve
         </div>
       )}
 
-      {!showEmptyOverlay && (
+      {!showEmptyOverlay && anchorRailReady && (
         <MessageAnchorRail
           anchors={messageAnchors}
           visibleRange={anchorVisibleRange}

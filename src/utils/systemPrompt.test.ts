@@ -9,14 +9,21 @@ const PROMPT_MEMORY_SECTION = [
   '',
   'CyberCode has a durable identity.',
   '',
-  '# Prompt Memory',
+  '# Evolution Memory',
   '',
   '## User',
   '',
   'User calls CyberCode 零.',
 ].join('\n')
-const CAVEMAN_SECTION = '# Caveman response compression\nKeep responses concise.'
-const PONYTAIL_SECTION = '# Ponytail minimal implementation discipline\nBuild the minimum complete solution.'
+const ACTIVE_POLICY_SECTION = [
+  '# Active Policy Overrides',
+  '',
+  '## Communication',
+  '- Compression mode is active.',
+  '',
+  '## Engineering Execution',
+  '- Strict implementation discipline is active.',
+].join('\n')
 
 function buildPrompt(params: {
   customSystemPrompt?: string
@@ -41,8 +48,9 @@ function buildPrompt(params: {
     defaultSystemPrompt: [
       'Default static coding instructions.',
       PROMPT_MEMORY_SECTION,
-      ...(params.ponytailEnabled ? [PONYTAIL_SECTION] : []),
-      ...(params.cavemanEnabled ? [CAVEMAN_SECTION] : []),
+      ...(params.ponytailEnabled || params.cavemanEnabled
+        ? [ACTIVE_POLICY_SECTION]
+        : []),
       'Default environment info.',
     ],
     appendSystemPrompt: params.appendSystemPrompt,
@@ -94,9 +102,9 @@ describe('system prompt assembly', () => {
       ponytailEnabled: true,
     })
 
-    expect(customPrompt).toContain(CAVEMAN_SECTION)
-    expect(customPrompt).toContain(PONYTAIL_SECTION)
-    expect(agentPrompt).toContain(CAVEMAN_SECTION)
-    expect(agentPrompt).toContain(PONYTAIL_SECTION)
+    expect(customPrompt).toContain(ACTIVE_POLICY_SECTION)
+    expect(customPrompt.filter(section => section === ACTIVE_POLICY_SECTION)).toHaveLength(1)
+    expect(agentPrompt).toContain(ACTIVE_POLICY_SECTION)
+    expect(agentPrompt.filter(section => section === ACTIVE_POLICY_SECTION)).toHaveLength(1)
   })
 })

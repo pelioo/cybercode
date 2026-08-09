@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-const ACTION_HIDE_DELAY_MS = 60
+const ACTION_HIDE_DELAY_MS = 24
 
 export function useMessageActionVisibility() {
   const [actionsVisible, setActionsVisible] = useState(false)

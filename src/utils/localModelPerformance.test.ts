@@ -152,14 +152,14 @@ describe('local model performance profile', () => {
         'General system details. '.repeat(100),
       '# Doing tasks\nThe user will primarily request you to perform software engineering tasks.\n' +
         'General task details. '.repeat(100),
-      '# Agent Work Rules\nKeep scoped changes.',
+      '# Engineering Execution\nKeep scoped changes.',
       '# Language\nAlways respond in Chinese.',
       '# Memory\nThe user prefers Bun.',
     ])
 
     expect(compacted.filter((part) => part === LOCAL_MODEL_CORE_PROMPT)).toHaveLength(1)
     expect(compacted.join('\n')).not.toContain('# Doing tasks')
-    expect(compacted.join('\n')).toContain('# Agent Work Rules')
+    expect(compacted.join('\n')).toContain('# Engineering Execution')
     expect(compacted.join('\n')).toContain('Always respond in Chinese')
     expect(compacted.join('\n')).toContain('The user prefers Bun')
   })

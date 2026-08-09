@@ -24,7 +24,7 @@ export { TOOL_SEARCH_TOOL_NAME } from './constants.js'
 
 import { TOOL_SEARCH_TOOL_NAME } from './constants.js'
 
-const PROMPT_HEAD = `Fetches full schema definitions for deferred tools so they can be called.
+const PROMPT_HEAD = `Finds deferred tools and makes their full schemas available so they can be called.
 
 `
 
@@ -41,9 +41,7 @@ function getToolLocationHint(): string {
     : 'Deferred tools appear by name in <available-deferred-tools> messages.'
 }
 
-const PROMPT_TAIL = ` Until fetched, only the name is known — there is no parameter schema, so the tool cannot be invoked. This tool takes a query, matches it against the deferred tool list, and returns the matched tools' complete JSONSchema definitions inside a <functions> block. Once a tool's schema appears in that result, it is callable exactly like any tool defined at the top of the prompt.
-
-Result format: each matched tool appears as one <function>{"description": "...", "name": "...", "parameters": {...}}</function> line inside the <functions> block — the same encoding as the tool list at the top of this prompt.
+const PROMPT_TAIL = ` Until loaded, only the name is known and the tool cannot be invoked safely. This tool takes a query and selects matching tools. Their complete schemas are available on the next model turn, after which they are callable exactly like tools already present in the prompt.
 
 Query forms:
 - "select:Read,Edit,Grep" — fetch these exact tools by name
@@ -105,6 +103,23 @@ export function isDeferredTool(tool: Tool): boolean {
   }
 
   return tool.shouldDefer === true
+}
+
+/**
+ * Provider-neutral loading defers MCP tools and built-ins that explicitly opt
+ * into lazy loading. Common web search tools remain eager so a browsing request
+ * does not need an extra discovery round trip.
+ */
+export function isLocallyDeferredTool(tool: Tool): boolean {
+  if (tool.alwaysLoad === true) return false
+
+  // Search is a common first-turn request. Keep the two built-in web tools
+  // eager on provider-neutral gateways so browsing does not pay an avoidable
+  // ToolSearch round trip. Other tools already marked shouldDefer have been
+  // designed for lazy loading and can use the local protocol safely.
+  if (tool.name === 'WebSearch' || tool.name === 'WebFetch') return false
+
+  return tool.isMcp === true || tool.shouldDefer === true
 }
 
 /**

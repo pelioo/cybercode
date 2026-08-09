@@ -3,9 +3,14 @@ import '@testing-library/jest-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { OFFICIAL_MODELS } from '../../constants/modelCatalog'
+import { useChatStore } from '../../stores/chatStore'
 import { useProviderStore } from '../../stores/providerStore'
 import { useRoutingStore } from '../../stores/routingStore'
-import { useSessionRuntimeStore } from '../../stores/sessionRuntimeStore'
+import {
+  DRAFT_RUNTIME_SELECTION_KEY,
+  NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY,
+  useSessionRuntimeStore,
+} from '../../stores/sessionRuntimeStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import type { SavedProvider } from '../../types/provider'
 import type { RouteGraph } from '../../types/routing'
@@ -56,6 +61,8 @@ function makeProvider(overrides: Partial<SavedProvider>): SavedProvider {
 }
 
 describe('ModelSelector', () => {
+  const originalSetSessionRuntime = useChatStore.getState().setSessionRuntime
+
   beforeEach(() => {
     localStorage.clear()
     useSettingsStore.setState({
@@ -66,6 +73,7 @@ describe('ModelSelector', () => {
       effortLevel: 'medium',
     })
     useSessionRuntimeStore.setState({ selections: {} })
+    useChatStore.setState({ setSessionRuntime: originalSetSessionRuntime })
     useProviderStore.setState({
       providers: [],
       activeId: null,
@@ -259,6 +267,97 @@ describe('ModelSelector', () => {
       modelId: 'cybercode-route-team-route',
       contextWindow: 262_144,
     })
+  })
+
+  it('shows the configured new-session default in the draft composer', () => {
+    useRoutingStore.setState({
+      dashboard: {
+        config: {
+          version: 1,
+          enabled: true,
+          profiles: [{
+            id: 'team-route',
+            name: 'Team route',
+            description: 'Custom route',
+            enabled: true,
+            strategy: 'priority',
+            strictFree: false,
+            allowExperimental: false,
+            maxAttempts: 2,
+            targets: [],
+            graph: publishedRouteGraph,
+          }],
+        },
+        sources: [],
+        health: [],
+        events: [],
+        routeAvailability: {
+          'team-route': { candidateCount: 2, available: true, contextWindow: 262_144 },
+        },
+      },
+    })
+    useSessionRuntimeStore.getState().setSelection(
+      NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY,
+      {
+        kind: 'route',
+        providerId: null,
+        routeId: 'team-route',
+        modelId: 'cybercode-route-team-route',
+        contextWindow: 262_144,
+      },
+    )
+
+    render(
+      <ModelSelector
+        runtimeKey={DRAFT_RUNTIME_SELECTION_KEY}
+        compact
+        variant="pill"
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: /Team route/i })).toBeInTheDocument()
+  })
+
+  it('persists a new-session default without sending runtime config to a fake session', () => {
+    useProviderStore.setState({
+      providers: [
+        makeProvider({
+          id: 'kimi',
+          presetId: 'kimi',
+          name: 'Kimi',
+          models: {
+            main: 'kimi-k2.6',
+            haiku: '',
+            sonnet: '',
+            opus: '',
+          },
+        }),
+      ],
+    })
+    const setSessionRuntime = vi.fn()
+    useChatStore.setState({ setSessionRuntime })
+
+    render(
+      <ModelSelector
+        runtimeKey={NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY}
+        compact
+        fullWidth
+        variant="pill"
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /Opus 4\.8/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Kimi/ }))
+    fireEvent.click(screen.getByText('kimi-k2.6').closest('button')!)
+
+    expect(
+      useSessionRuntimeStore.getState().selections[NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY],
+    ).toEqual({
+      providerId: 'kimi',
+      modelId: 'kimi-k2.6',
+      contextWindow: undefined,
+    })
+    expect(setSessionRuntime).not.toHaveBeenCalled()
   })
 
   it('does not offer an unpublished draft even if stale availability marks it ready', () => {

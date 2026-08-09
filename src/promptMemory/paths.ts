@@ -1,9 +1,11 @@
 import { join } from 'path'
+import { getAutoMemPath } from '../memdir/paths.js'
 import { getClaudeConfigHomeDir } from '../utils/envUtils.js'
 
 export const SOUL_FILENAME = 'SOUL.md'
 export const PROMPT_MEMORY_DIRNAME = 'prompt-memory'
 export const BRIEF_FILENAME = 'BRIEF.md'
+export const PROJECT_EXPERIENCE_FILENAME = 'PROJECT_EXPERIENCE.md'
 export const USER_PROMPT_MEMORY_FILENAME = 'USER.md'
 export const PROMPT_MEMORY_CONFIG_FILENAME = 'config.json'
 
@@ -17,6 +19,10 @@ export function getPromptMemoryDir(): string {
 
 export function getBriefPath(): string {
   return join(getPromptMemoryDir(), BRIEF_FILENAME).normalize('NFC')
+}
+
+export function getProjectExperiencePath(): string {
+  return join(getAutoMemPath(), PROJECT_EXPERIENCE_FILENAME).normalize('NFC')
 }
 
 export function getUserPromptMemoryPath(): string {

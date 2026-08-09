@@ -1,6 +1,6 @@
 import { api } from './client'
 
-export type PromptMemoryTarget = 'soul' | 'brief' | 'user'
+export type PromptMemoryTarget = 'soul' | 'brief' | 'project' | 'user'
 export type PromptMemoryFormat = 'empty' | 'plain' | 'entries'
 
 export type PromptMemoryFile = {
@@ -70,6 +70,8 @@ export type PromptMemoryInsightCategory =
   | 'quality'
   | 'boundaries'
   | 'expertise'
+  | 'project-method'
+  | 'decision'
   | 'meta-method'
   | 'environment'
   | 'lesson'
@@ -77,7 +79,7 @@ export type PromptMemoryInsightCategory =
 
 export type PromptMemoryInsight = {
   id: string
-  target: 'user' | 'brief'
+  target: 'user' | 'project' | 'brief'
   category: PromptMemoryInsightCategory
   content: string
   raw: string
@@ -90,6 +92,8 @@ export type PromptMemoryInsights = {
   stats: {
     total: number
     user: number
+    project: number
+    globalMethods: number
     methods: number
     dimensions: number
     automaticUpdates: number

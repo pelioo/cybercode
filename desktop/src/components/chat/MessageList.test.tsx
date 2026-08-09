@@ -26,6 +26,7 @@ function makeSessionState(overrides: Partial<PerSessionState> = {}): PerSessionS
     historyBuffer: [],
     recentBuffer: [],
     allMessagesLoaded: true,
+    anchorsLoaded: true,
     historyLoadState: 'loaded' as const,
     chatState: 'idle',
     connectionState: 'connected',
@@ -1993,10 +1994,12 @@ describe('MessageList nested tool calls', () => {
     expect(userActions?.parentElement?.className).not.toContain('mr-[16px]')
     expect(assistantActions?.parentElement?.className).not.toContain('ml-[16px]')
     expect(assistantActions?.parentElement?.className).not.toContain('min-h-6')
-    expect(userActions?.className).toContain('pointer-events-none')
-    expect(assistantActions?.className).toContain('pointer-events-none')
+    expect(userActions?.className).toContain('pointer-events-auto')
+    expect(assistantActions?.className).toContain('pointer-events-auto')
     expect(userActions?.className).toContain('w-auto')
     expect(assistantActions?.className).toContain('w-auto')
+    expect(userActions?.className).toContain('px-[6px]')
+    expect(assistantActions?.className).toContain('px-[6px]')
 
     const userActionCluster = userActions?.querySelector('[data-message-action-cluster]')
     const assistantActionCluster = assistantActions?.querySelector('[data-message-action-cluster]')
@@ -2004,6 +2007,48 @@ describe('MessageList nested tool calls', () => {
     expect(assistantActionCluster?.className).toContain('pointer-events-auto')
     expect(userActionCluster?.className).not.toContain('pt-[8px]')
     expect(assistantActionCluster?.className).not.toContain('pt-[8px]')
+  })
+
+  it('reveals message actions from the bubble instead of the full empty row', async () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'user-hover-area',
+              type: 'user_text',
+              content: '只在气泡附近显示操作按钮',
+              timestamp: 1,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    const bubble = screen
+      .getByText('只在气泡附近显示操作按钮')
+      .closest('[data-message-bubble="user"]')
+    const row = bubble?.closest('[data-message-row="user"]')
+    const visibility = screen
+      .getByRole('button', { name: 'Copy prompt' })
+      .closest('.message-action-visibility')
+
+    expect(row).toBeTruthy()
+    expect(bubble).toBeTruthy()
+    expect(visibility?.getAttribute('data-actions-visible')).toBe('false')
+
+    fireEvent.pointerEnter(row!)
+    expect(visibility?.getAttribute('data-actions-visible')).toBe('false')
+
+    fireEvent.pointerEnter(bubble!)
+    expect(visibility?.getAttribute('data-actions-visible')).toBe('true')
+
+    fireEvent.pointerLeave(bubble!)
+    await waitFor(() => {
+      expect(visibility?.getAttribute('data-actions-visible')).toBe('false')
+    })
   })
 
   it('hides the bottommost assistant actions after leaving downward', async () => {
@@ -2031,9 +2076,11 @@ describe('MessageList nested tool calls', () => {
       .getByRole('button', { name: 'Copy reply' })
       .closest('[data-message-action-cluster]')
     const visibility = actionCluster?.closest('.message-action-visibility')
+    const actions = actionCluster?.closest('[data-message-actions]')
 
     expect(bubble).toBeTruthy()
     expect(actionCluster).toBeTruthy()
+    expect(actions).toBeTruthy()
     expect(visibility?.getAttribute('data-actions-visible')).toBe('false')
 
     fireEvent.pointerEnter(bubble!)
@@ -2046,14 +2093,14 @@ describe('MessageList nested tool calls', () => {
 
     fireEvent.pointerEnter(bubble!)
     fireEvent.pointerLeave(bubble!)
-    fireEvent.pointerEnter(actionCluster!)
+    fireEvent.pointerEnter(actions!)
 
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 90))
     })
     expect(visibility?.getAttribute('data-actions-visible')).toBe('true')
 
-    fireEvent.pointerLeave(actionCluster!)
+    fireEvent.pointerLeave(actions!)
     await waitFor(() => {
       expect(visibility?.getAttribute('data-actions-visible')).toBe('false')
     })
@@ -2454,7 +2501,7 @@ describe('MessageList nested tool calls', () => {
     expect(container.querySelector<HTMLElement>('[data-message-error]')?.style.color).toBe('var(--color-error)')
   })
 
-  it('retries a loaded anchor when the first WebKit scroll write is ignored', async () => {
+  it('keeps a loaded anchor centered through delayed WebKit scroll rebound', async () => {
     const originalRect = Element.prototype.getBoundingClientRect
     let scrollTop = 200
     const rectSpy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
@@ -2504,10 +2551,23 @@ describe('MessageList nested tool calls', () => {
       })
 
       fireEvent.click(anchor)
+      expect(anchor.getAttribute('aria-busy')).toBe('true')
 
       // targetTop = 200 + (900 - 100); centered by (400 - 100) / 2.
       await waitFor(() => expect(scrollTop).toBe(850))
       expect(scrollWriteCount).toBeGreaterThan(1)
+
+      // Native WKWebView can restore the old viewport after the first couple
+      // of frames while a long transcript finishes layout. The active jump
+      // must reassert its target instead of looking like the click was ignored.
+      const writesAfterInitialLanding = scrollWriteCount
+      scrollTop = 200
+      await waitFor(() => expect(scrollTop).toBe(850))
+      expect(scrollWriteCount).toBeGreaterThan(writesAfterInitialLanding)
+
+      await waitFor(() => {
+        expect(screen.getByTestId('message-anchor-srv-u1').getAttribute('aria-busy')).toBe('false')
+      })
       const userBubble = screen.getByText('first question').closest('[data-message-bubble="user"]')
       expect(userBubble?.classList.contains('anchor-user-bubble-highlight')).toBe(true)
       expect(userBubble?.closest('[data-render-index="0"]')?.classList.contains('anchor-jump-flash')).toBe(false)
@@ -2528,6 +2588,143 @@ describe('MessageList nested tool calls', () => {
         expect(userBubble?.classList.contains(firstVariant)).toBe(false)
         expect(userBubble?.classList.contains(secondVariant)).toBe(true)
       })
+
+      fireEvent.wheel(scroller)
+      scrollTop = 300
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 220))
+      })
+      expect(scrollTop).toBe(300)
+    } finally {
+      rectSpy.mockRestore()
+    }
+  })
+
+  it('does not show session anchors until history and anchor metadata are ready', async () => {
+    const originalRect = Element.prototype.getBoundingClientRect
+    const rectSpy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      const testId = this.getAttribute('data-testid') ?? ''
+      if (testId.startsWith('message-anchor-rail')) return new DOMRect(0, 0, 24, 600)
+      return originalRect.call(this)
+    })
+    const originalLoadAnchors = useChatStore.getState().loadAnchors
+    const loadAnchors = vi.fn(async () => {})
+
+    try {
+      useChatStore.setState({
+        loadAnchors,
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            historyLoadState: 'loading',
+            anchorsLoaded: false,
+            messages: [
+              { id: 'local-u1', serverId: 'srv-u1', type: 'user_text', content: 'first question', timestamp: 1 },
+              { id: 'local-u2', serverId: 'srv-u2', type: 'user_text', content: 'second question', timestamp: 2 },
+              { id: 'local-u3', serverId: 'srv-u3', type: 'user_text', content: 'third question', timestamp: 3 },
+            ],
+            anchors: [
+              { seq: 0, messageId: 'srv-u1', preview: 'first question' },
+              { seq: 1, messageId: 'srv-u2', preview: 'second question' },
+              { seq: 2, messageId: 'srv-u3', preview: 'third question' },
+            ],
+          }),
+        },
+      })
+
+      render(<MessageList />)
+      expect(screen.queryByTestId('message-anchor-rail')).toBeNull()
+
+      act(() => {
+        useChatStore.setState((state) => ({
+          sessions: {
+            ...state.sessions,
+            [ACTIVE_TAB]: {
+              ...state.sessions[ACTIVE_TAB]!,
+              historyLoadState: 'loaded',
+            },
+          },
+        }))
+      })
+
+      expect(loadAnchors).not.toHaveBeenCalled()
+      await waitFor(() => expect(loadAnchors).toHaveBeenCalledWith(ACTIVE_TAB, undefined))
+      expect(screen.queryByTestId('message-anchor-rail')).toBeNull()
+
+      act(() => {
+        useChatStore.setState((state) => ({
+          sessions: {
+            ...state.sessions,
+            [ACTIVE_TAB]: {
+              ...state.sessions[ACTIVE_TAB]!,
+              anchorsLoaded: true,
+            },
+          },
+        }))
+      })
+
+      expect(await screen.findByTestId('message-anchor-rail')).toBeTruthy()
+      expect(screen.getByTestId('message-anchor-srv-u1')).toBeTruthy()
+    } finally {
+      act(() => {
+        useChatStore.setState({ loadAnchors: originalLoadAnchors })
+      })
+      rectSpy.mockRestore()
+    }
+  })
+
+  it('merges an optimistic user question into full-session anchors without duplicating it', async () => {
+    const originalRect = Element.prototype.getBoundingClientRect
+    const rectSpy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      const testId = this.getAttribute('data-testid') ?? ''
+      if (testId.startsWith('message-anchor-rail')) return new DOMRect(0, 0, 24, 600)
+      return originalRect.call(this)
+    })
+
+    try {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            messages: [
+              { id: 'local-u1', serverId: 'srv-u1', type: 'user_text', content: 'first question', timestamp: 1 },
+              { id: 'local-u2', serverId: 'srv-u2', type: 'user_text', content: 'second question', timestamp: 2 },
+              { id: 'local-u3', serverId: 'srv-u3', type: 'user_text', content: 'third question', timestamp: 3 },
+              { id: 'local-u4', type: 'user_text', content: 'new optimistic question', timestamp: 4 },
+            ],
+            anchors: [
+              { seq: 0, messageId: 'srv-u1', preview: 'first question' },
+              { seq: 1, messageId: 'srv-u2', preview: 'second question' },
+              { seq: 2, messageId: 'srv-u3', preview: 'third question' },
+            ],
+          }),
+        },
+      })
+
+      render(<MessageList />)
+
+      expect(await screen.findByTestId('message-anchor-local-u4')).toBeTruthy()
+      expect(screen.getByTestId('message-anchor-srv-u1')).toBeTruthy()
+      expect(screen.getByTestId('message-anchor-srv-u2')).toBeTruthy()
+      expect(screen.getByTestId('message-anchor-srv-u3')).toBeTruthy()
+
+      act(() => {
+        useChatStore.setState((state) => ({
+          sessions: {
+            ...state.sessions,
+            [ACTIVE_TAB]: {
+              ...state.sessions[ACTIVE_TAB]!,
+              anchors: [
+                { seq: 0, messageId: 'srv-u1', preview: 'first question' },
+                { seq: 1, messageId: 'srv-u2', preview: 'second question' },
+                { seq: 2, messageId: 'srv-u3', preview: 'third question' },
+                { seq: 3, messageId: 'srv-u4', preview: 'new optimistic question' },
+              ],
+            },
+          },
+        }))
+      })
+
+      expect(await screen.findByTestId('message-anchor-local-u4')).toBeTruthy()
+      expect(screen.queryByTestId('message-anchor-srv-u4')).toBeNull()
     } finally {
       rectSpy.mockRestore()
     }
@@ -2673,7 +2870,9 @@ describe('MessageList nested tool calls', () => {
 
       // targetTop = 50 + (800 - 100); centered by (400 - 80) / 2.
       await waitFor(() => expect(scrollTop).toBe(590))
-      expect(screen.getByTestId('message-anchor-bar-srv-old').className).not.toContain('anchor-bar-loading')
+      await waitFor(() => {
+        expect(screen.getByTestId('message-anchor-bar-srv-old').className).not.toContain('anchor-bar-loading')
+      })
     } finally {
       act(() => {
         useChatStore.setState({ loadHistoryUntil: loadHistoryUntilOrig })
@@ -2769,7 +2968,7 @@ describe('MessageList nested tool calls', () => {
               { id: 'local-a-3', type: 'assistant_text', content: 'third answer', timestamp: 6 },
             ],
             anchors: undefined,
-            anchorsLoaded: false,
+            anchorsLoaded: true,
           }),
         },
       })

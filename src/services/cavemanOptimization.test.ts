@@ -31,18 +31,20 @@ describe('Caveman token optimization', () => {
 
     const service = new CavemanOptimizationService()
     expect(service.getStatus()).toEqual({ enabled: false, mode: 'full' })
-    expect(service.getSystemPrompt()).toBeNull()
+    expect(service.getPolicyContribution()).toBeNull()
 
     const writer = new CavemanOptimizationService()
     expect(writer.setEnabled(true).enabled).toBe(true)
     expect(service.getStatus().enabled).toBe(true)
-    expect(service.getSystemPrompt()).toContain('Be concise and direct')
-    expect(service.getSystemPrompt()).toContain('irreversible actions')
-    expect(service.getSystemPrompt()!.length).toBeLessThan(400)
+    expect(service.getPolicyContribution()).toEqual({
+      source: 'optimization',
+      label: 'Caveman',
+      communication: { verbosity: 'compressed' },
+    })
 
     writer.setEnabled(false)
     expect(service.getStatus().enabled).toBe(false)
-    expect(service.getSystemPrompt()).toBeNull()
+    expect(service.getPolicyContribution()).toBeNull()
   })
 
   test('falls back to disabled when the persisted config is invalid', () => {
@@ -57,7 +59,7 @@ describe('Caveman token optimization', () => {
 
     const service = new CavemanOptimizationService()
     expect(service.getStatus()).toEqual({ enabled: false, mode: 'full' })
-    expect(service.getSystemPrompt()).toBeNull()
+    expect(service.getPolicyContribution()).toBeNull()
   })
 
   test('serves the global switch through the token optimization API', async () => {

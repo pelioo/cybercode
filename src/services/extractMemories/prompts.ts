@@ -1,12 +1,9 @@
 /**
  * Prompt templates for the background memory extraction agent.
  *
- * The extraction agent runs as a perfect fork of the main conversation — same
- * system prompt, same message prefix. The main agent's system prompt always
- * has full save instructions; when the main agent writes memories itself,
- * extractMemories.ts skips that turn (hasMemoryWritesSince). This prompt
- * fires only when the main agent didn't write, so the save-criteria here
- * overlap the system prompt's harmlessly.
+ * The extraction agent runs after a completed turn. Detailed persistence rules
+ * live here instead of in the main conversation's system prompt so user work
+ * stays focused on the active request.
  */
 
 import { feature } from 'bun:bundle'
@@ -90,6 +87,34 @@ export function buildExtractAutoOnlyPrompt(
     ...WHAT_NOT_TO_SAVE_SECTION,
     '',
     ...howToSave,
+  ].join('\n')
+}
+
+/**
+ * Build the KAIROS long-session extraction prompt. New memories remain
+ * append-only daily observations; nightly maintenance owns consolidation.
+ */
+export function buildExtractAssistantDailyLogPrompt(
+  newMessageCount: number,
+  existingMemories: string,
+  dailyLogPath: string,
+): string {
+  return [
+    opener(newMessageCount, existingMemories),
+    '',
+    'This is a long-lived assistant session. Record durable observations by appending concise timestamped bullets to today\'s daily log:',
+    `\`${dailyLogPath}\``,
+    '',
+    'If the log exists, read it before using Edit to append. If it does not exist, create it with Write. Never rewrite or reorganize earlier observations.',
+    'Do not edit MEMORY.md or topic files in this review. Nightly maintenance distills daily logs into those files.',
+    '',
+    'Save only durable information:',
+    '- Explicit user preferences, corrections, and remember/forget requests',
+    '- Stable user facts, roles, or goals',
+    '- Project decisions and rationale that cannot be derived from the code',
+    '- Useful pointers to external systems',
+    '',
+    ...WHAT_NOT_TO_SAVE_SECTION,
   ].join('\n')
 }
 

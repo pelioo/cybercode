@@ -5,6 +5,9 @@ export type MessageAnchor = {
   /** Global question index across the whole session (defines layout order). */
   seq: number
   id: string
+  /** Stable transcript id used when the optimistic local message has a
+   *  different temporary id. */
+  loadId?: string
   preview: string
   answerPreview?: string
   /** Index within renderItems (not the Virtuoso index); null while the

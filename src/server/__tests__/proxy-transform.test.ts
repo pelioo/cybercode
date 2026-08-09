@@ -168,6 +168,26 @@ describe('anthropicToOpenaiChat', () => {
     expect(generic.reasoning_effort).toBeUndefined()
   })
 
+  test('adds OpenAI cache affinity and streaming usage only when requested', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-5',
+      max_tokens: 100,
+      stream: true,
+      messages: [{ role: 'user', content: 'Hi' }],
+    }
+
+    const cached = anthropicToOpenaiChat(req, {
+      promptCacheKey: 'cybercode_cache_key',
+      includeStreamUsage: true,
+    })
+    expect(cached.prompt_cache_key).toBe('cybercode_cache_key')
+    expect(cached.stream_options).toEqual({ include_usage: true })
+
+    const generic = anthropicToOpenaiChat(req)
+    expect(generic.prompt_cache_key).toBeUndefined()
+    expect(generic.stream_options).toBeUndefined()
+  })
+
   test('assistant message with tool_use', () => {
     const req: AnthropicRequest = {
       model: 'gpt-4',
@@ -335,7 +355,9 @@ describe('openaiChatToAnthropic', () => {
       },
     }
     const result = openaiChatToAnthropic(res, 'gpt-4')
+    expect(result.usage.input_tokens).toBe(20)
     expect(result.usage.cache_read_input_tokens).toBe(80)
+    expect(result.usage.cache_creation_input_tokens).toBe(0)
   })
 })
 
@@ -467,6 +489,19 @@ describe('anthropicToOpenaiResponses', () => {
     expect((result as Record<string, unknown>).stop).toBeUndefined()
     expect((result as Record<string, unknown>).stop_sequences).toBeUndefined()
   })
+
+  test('adds a prompt cache key only when supplied by the proxy', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-5',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hi' }],
+    }
+
+    expect(anthropicToOpenaiResponses(req, {
+      promptCacheKey: 'cybercode_cache_key',
+    }).prompt_cache_key).toBe('cybercode_cache_key')
+    expect(anthropicToOpenaiResponses(req).prompt_cache_key).toBeUndefined()
+  })
 })
 
 // ─── openaiResponsesToAnthropic ─────────────────────────────────
@@ -491,6 +526,28 @@ describe('openaiResponsesToAnthropic', () => {
     expect(result.stop_reason).toBe('end_turn')
     expect(result.usage.input_tokens).toBe(10)
     expect(result.usage.output_tokens).toBe(5)
+  })
+
+  test('maps cached input tokens without double-counting total input', () => {
+    const res: OpenAIResponsesResponse = {
+      id: 'resp_cache',
+      object: 'response',
+      created_at: 0,
+      model: 'gpt-5',
+      status: 'completed',
+      output: [],
+      usage: {
+        input_tokens: 100,
+        output_tokens: 5,
+        total_tokens: 105,
+        input_tokens_details: { cached_tokens: 80 },
+      },
+    }
+
+    const result = openaiResponsesToAnthropic(res, 'gpt-5')
+    expect(result.usage.input_tokens).toBe(20)
+    expect(result.usage.cache_read_input_tokens).toBe(80)
+    expect(result.usage.cache_creation_input_tokens).toBe(0)
   })
 
   test('function_call → tool_use', () => {

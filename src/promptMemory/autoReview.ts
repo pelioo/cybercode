@@ -24,12 +24,19 @@ import type { REPLHookContext } from '../utils/hooks/postSamplingHooks.js'
 import { createSystemMessage, createUserMessage } from '../utils/messages.js'
 import { jsonStringify } from '../utils/slowOperations.js'
 import { getSettingsWithSources } from '../utils/settings/settings.js'
+import { asSystemPrompt } from '../utils/systemPromptType.js'
+import { PromptMemoryTool } from '../tools/PromptMemoryTool/PromptMemoryTool.js'
 import { PROMPT_MEMORY_TOOL_NAME } from '../tools/PromptMemoryTool/constants.js'
 import {
   getBriefPath,
+  getProjectExperiencePath,
   getPromptMemoryDir,
   getUserPromptMemoryPath,
 } from './paths.js'
+import {
+  collectProjectExperienceCorpus,
+  type ProjectExperienceCorpus,
+} from './projectCorpus.js'
 import {
   readPromptMemoryFile,
   type PromptMemoryAction,
@@ -37,8 +44,9 @@ import {
 } from './store.js'
 
 const DEFAULT_REVIEW_INTERVAL_TURNS = 6
-const DEFAULT_META_REVIEW_INTERVAL = 5
-const MIN_META_REVIEW_ENTRIES = 3
+const DEFAULT_GLOBAL_REVIEW_INTERVAL = 5
+const MIN_GLOBAL_REVIEW_PROJECTS = 1
+const MIN_GLOBAL_REVIEW_ENTRIES = 3
 const LOG_FILENAME = 'AUTO_REVIEW_LOG.jsonl'
 const STATE_FILENAME = 'AUTO_REVIEW_STATE.json'
 export const PROMPT_MEMORY_AUTO_REVIEW_TOOL_USE_ID =
@@ -79,15 +87,16 @@ type PendingReview = {
 }
 
 export type PromptMemoryAutoReviewState = {
-  version: 1
-  periodicReviewsSinceMeta: number
+  version: 2
+  periodicReviewsSinceGlobal: number
   lastReviewAt?: string
-  lastMetaReviewAt?: string
+  lastGlobalReviewAt?: string
+  lastGlobalCorpusFingerprint?: string
 }
 
 const DEFAULT_AUTO_REVIEW_STATE: PromptMemoryAutoReviewState = {
-  version: 1,
-  periodicReviewsSinceMeta: 0,
+  version: 2,
+  periodicReviewsSinceGlobal: 0,
 }
 
 let lastReviewedMessageUuid: string | undefined
@@ -108,11 +117,11 @@ function getReviewIntervalTurns(): number {
 
 function getMetaReviewInterval(): number {
   const raw = process.env.CYBER_PROMPT_MEMORY_META_REVIEW_INTERVAL
-  if (!raw) return DEFAULT_META_REVIEW_INTERVAL
+  if (!raw) return DEFAULT_GLOBAL_REVIEW_INTERVAL
   const parsed = Number.parseInt(raw, 10)
   return Number.isFinite(parsed) && parsed > 0
     ? parsed
-    : DEFAULT_META_REVIEW_INTERVAL
+    : DEFAULT_GLOBAL_REVIEW_INTERVAL
 }
 
 export function normalizePromptMemoryLanguage(
@@ -151,20 +160,36 @@ function normalizeAutoReviewState(value: unknown): PromptMemoryAutoReviewState {
   if (typeof value !== 'object' || value === null) {
     return { ...DEFAULT_AUTO_REVIEW_STATE }
   }
-  const candidate = value as Partial<PromptMemoryAutoReviewState>
-  const periodicReviewsSinceMeta = Number.isFinite(
-    candidate.periodicReviewsSinceMeta,
-  )
-    ? Math.max(0, Math.floor(candidate.periodicReviewsSinceMeta ?? 0))
+  const candidate = value as Partial<PromptMemoryAutoReviewState> & {
+    periodicReviewsSinceMeta?: number
+    projectUpdatesSinceGlobal?: number
+    lastMetaReviewAt?: string
+  }
+  const rawReviewCount =
+    candidate.periodicReviewsSinceGlobal ??
+    candidate.projectUpdatesSinceGlobal ??
+    candidate.periodicReviewsSinceMeta
+  const periodicReviewsSinceGlobal = Number.isFinite(rawReviewCount)
+    ? Math.max(0, Math.floor(rawReviewCount ?? 0))
     : 0
   return {
-    version: 1,
-    periodicReviewsSinceMeta,
+    version: 2,
+    periodicReviewsSinceGlobal,
     ...(typeof candidate.lastReviewAt === 'string'
       ? { lastReviewAt: candidate.lastReviewAt }
       : {}),
-    ...(typeof candidate.lastMetaReviewAt === 'string'
-      ? { lastMetaReviewAt: candidate.lastMetaReviewAt }
+    ...(typeof (candidate.lastGlobalReviewAt ?? candidate.lastMetaReviewAt) ===
+    'string'
+      ? {
+          lastGlobalReviewAt:
+            candidate.lastGlobalReviewAt ?? candidate.lastMetaReviewAt,
+        }
+      : {}),
+    ...(typeof candidate.lastGlobalCorpusFingerprint === 'string'
+      ? {
+          lastGlobalCorpusFingerprint:
+            candidate.lastGlobalCorpusFingerprint,
+        }
       : {}),
   }
 }
@@ -200,45 +225,52 @@ export async function writePromptMemoryAutoReviewState(
 }
 
 export function planPromptMemoryReview(params: {
-  trigger: ScheduledReviewTrigger
   state: PromptMemoryAutoReviewState
-  memoryEntryCount: number
+  periodicReview: boolean
+  projectCount: number
+  projectEntryCount: number
+  corpusFingerprint: string
   metaInterval?: number
   now?: string
 }): {
-  trigger: ReviewTrigger
+  runGlobalReview: boolean
   nextState: PromptMemoryAutoReviewState
 } {
-  if (params.trigger === 'explicit') {
-    return {
-      trigger: 'explicit',
-      nextState: normalizeAutoReviewState(params.state),
-    }
-  }
-
   const state = normalizeAutoReviewState(params.state)
   const requestedMetaInterval =
-    params.metaInterval ?? DEFAULT_META_REVIEW_INTERVAL
+    params.metaInterval ?? DEFAULT_GLOBAL_REVIEW_INTERVAL
   const metaInterval =
     Number.isFinite(requestedMetaInterval) && requestedMetaInterval > 0
       ? Math.floor(requestedMetaInterval)
-      : DEFAULT_META_REVIEW_INTERVAL
-  const periodicReviewsSinceMeta = Math.min(
-    state.periodicReviewsSinceMeta + 1,
+      : DEFAULT_GLOBAL_REVIEW_INTERVAL
+  const periodicReviewsSinceGlobal = Math.min(
+    state.periodicReviewsSinceGlobal + (params.periodicReview ? 1 : 0),
     metaInterval,
   )
   const now = params.now ?? new Date().toISOString()
-  const shouldRunMeta =
-    periodicReviewsSinceMeta >= metaInterval &&
-    params.memoryEntryCount >= MIN_META_REVIEW_ENTRIES
+  const hasNewCorpus =
+    params.corpusFingerprint.length > 0 &&
+    params.corpusFingerprint !== state.lastGlobalCorpusFingerprint
+  const runGlobalReview =
+    periodicReviewsSinceGlobal >= metaInterval &&
+    params.projectCount >= MIN_GLOBAL_REVIEW_PROJECTS &&
+    params.projectEntryCount >= MIN_GLOBAL_REVIEW_ENTRIES &&
+    hasNewCorpus
 
   return {
-    trigger: shouldRunMeta ? 'meta' : 'interval',
+    runGlobalReview,
     nextState: {
       ...state,
-      periodicReviewsSinceMeta: shouldRunMeta ? 0 : periodicReviewsSinceMeta,
+      periodicReviewsSinceGlobal: runGlobalReview
+        ? 0
+        : periodicReviewsSinceGlobal,
       lastReviewAt: now,
-      ...(shouldRunMeta ? { lastMetaReviewAt: now } : {}),
+      ...(runGlobalReview
+        ? {
+            lastGlobalReviewAt: now,
+            lastGlobalCorpusFingerprint: params.corpusFingerprint,
+          }
+        : {}),
     },
   }
 }
@@ -395,67 +427,94 @@ function formatEntries(label: string, entries: string[]): string {
 
 export function buildPromptMemoryAutoReviewPrompt(params: {
   newMessageCount: number
-  trigger: ReviewTrigger
+  trigger: ScheduledReviewTrigger
   briefEntries: string[]
+  projectEntries: string[]
   userEntries: string[]
   preferredLanguage?: string
 }): string {
   const preferredLanguage = normalizePromptMemoryLanguage(params.preferredLanguage)
   return [
-    'You are the automatic Prompt Memory reviewer for CyberCode.',
+    'You are CyberCode\'s background memory reviewer.',
     '',
-    params.trigger === 'meta'
-      ? `This is a low-frequency meta-consolidation review. Use the most recent ~${params.newMessageCount} visible messages as supporting evidence, then review the current prompt-memory entries as one system.`
-      : `Analyze only the most recent ~${params.newMessageCount} visible messages above. Decide whether future conversations would benefit from updating the short prompt-memory files.`,
+    `The user-facing agent has finished its response. Analyze only the most recent ~${params.newMessageCount} visible messages above and persist durable information without involving the main task.`,
     '',
-    'Current prompt-memory entries:',
+    'Current evolution-memory entries:',
     '',
-    formatEntries('BRIEF.md', params.briefEntries),
+    formatEntries(
+      'BRIEF.md (global methods, read-only in this review)',
+      params.briefEntries,
+    ),
+    '',
+    formatEntries('PROJECT_EXPERIENCE.md', params.projectEntries),
     '',
     formatEntries('USER.md', params.userEntries),
     '',
     'Write rules:',
     '- Use the PromptMemory tool only when there is a durable memory change.',
     '- Allowed actions: add, replace, remove.',
-    '- Allowed targets: brief, user.',
-    '- Never write or modify SOUL.md from this automatic review.',
-    '- BRIEF.md stores stable agent facts, environment facts, tool quirks, and cross-session working lessons.',
+    '- Allowed targets: project, user.',
+    '- Never write or modify SOUL.md or BRIEF.md from this review.',
+    '- PROJECT_EXPERIENCE.md stores reusable lessons, constraints, decisions, environment facts, and working methods for the current project only.',
     '- USER.md stores user preferences, communication style, stable personal workflow preferences, and explicit remember/forget requests.',
     '- Prefix every added or replaced entry with exactly one semantic category tag.',
     `- Write the human-readable body of every added or replaced entry in ${preferredLanguage}. Keep the semantic category tag in English exactly as specified below. Preserve technical identifiers, paths, commands, and quoted text in their original language.`,
     '- USER.md tags: [identity], [communication], [collaboration], [workflow], [quality], [boundaries], [expertise].',
-    '- BRIEF.md tags: [meta-method], [environment], [lesson].',
-    '- [meta-method] captures a reusable way of working across tasks, such as planning order, verification sequence, escalation thresholds, or how to decide between alternatives. It is not a project recipe; project recipes belong in Skills or project memory.',
+    '- PROJECT_EXPERIENCE.md tags: [project-method], [environment], [lesson], [decision].',
     '- Basic user relationship facts must go in USER.md, not project memory: the user\'s preferred language, communication style, the user\'s name/nickname, and any name/nickname the user gives CyberCode/the assistant/agent.',
     '- If the user names CyberCode/the assistant/agent or says how they want to call it, save that in USER.md so every project can answer identity/name questions consistently.',
+    '- A project entry must remain useful in a later conversation about this same repository. Do not save task progress, temporary plans, or facts directly derivable from current code.',
+    '- Never promote a lesson directly to BRIEF.md. Cross-project promotion is handled by a separate low-frequency reviewer.',
     '- Prefer replace/remove when an existing entry is stale, wrong, or duplicated.',
     '- Keep each new entry concise, declarative, and under 220 characters.',
     '- An explicit preference, correction, or remember request may be saved immediately. An implicit habit must be supported by at least two consistent examples in the reviewed messages; one isolated choice is not a durable preference.',
+    '- Do not save a generic concise or direct preference merely because the user wrote a short message. Require an explicit request or repeated evidence that clearly applies to future conversations.',
     '- Treat a correction as evidence about future collaboration only when its wording or repetition clearly generalizes beyond the current task.',
     '- Do not infer personality, motives, emotions, medical state, politics, religion, sexuality, finances, or other sensitive/private traits. Never label the user negatively.',
     '- Do not store secrets, credentials, API keys, private tokens, one-off tasks, transient plans, temporary prices, or details that are only useful inside the current conversation.',
-    '- Do not store project-specific facts in BRIEF.md when the project memory directory is the better home.',
-    ...(params.trigger === 'meta'
-      ? [
-          '',
-          'Meta-consolidation rules:',
-          '- Look for several narrow lessons or methods that express the same underlying decision principle.',
-          '- Prefer one concise, actionable [meta-method] over duplicated or overlapping entries.',
-          '- A useful [meta-method] should say when the principle applies, what decision or action improves the work, and how to verify the result when relevant.',
-          '- Merge by replacing the strongest existing entry and removing only entries made redundant by the replacement.',
-          '- Preserve concrete environment constraints and stable user facts; do not generalize them away.',
-          '- Require support from at least two existing entries or repeated evidence. Never invent a higher-order rule merely to produce a change.',
-          '- Remove stale, contradictory, or low-value entries when the evidence is clear.',
-        ]
-      : []),
     '',
     params.trigger === 'explicit'
       ? 'The recent user text contained an explicit memory/preference signal. Prioritize it, but still reject unsafe or temporary content.'
-      : params.trigger === 'meta'
-        ? 'Consolidate only when the result is more general, more actionable, and shorter than the entries it replaces. No tool call is better than forced abstraction.'
-        : 'This is a periodic review. Be conservative; no tool call is better than low-value memory.',
+      : 'This is a periodic review. Be conservative; no tool call is better than low-value memory.',
     '',
     'If no update is warranted, do not call any tool. Reply exactly: No prompt-memory changes.',
+  ].join('\n')
+}
+
+export function buildGlobalPromptMemoryReviewPrompt(params: {
+  corpus: ProjectExperienceCorpus
+  briefEntries: string[]
+  preferredLanguage?: string
+}): string {
+  const preferredLanguage = normalizePromptMemoryLanguage(params.preferredLanguage)
+  return [
+    'You are CyberCode\'s cross-project experience distiller.',
+    '',
+    'Derive global working principles only from the project experience corpus below. Do not use recent conversation text or user preferences as evidence. Experience from one project may be sufficient when it supports a genuinely general principle.',
+    '',
+    formatEntries('Current BRIEF.md global methods', params.briefEntries),
+    '',
+    'Project experience corpus:',
+    '(Project labels are anonymous and indicate distinct sources.)',
+    '',
+    params.corpus.content || 'empty',
+    '',
+    'Write rules:',
+    '- Use the PromptMemory tool only when the global layer should change.',
+    '- Allowed actions: add, replace, remove.',
+    '- The only allowed target is brief.',
+    '- Every added or replaced entry must start with [meta-method].',
+    `- Write the human-readable body in ${preferredLanguage}; preserve technical identifiers and quoted text in their original language.`,
+    '- A single project may support a [meta-method]. Require support from multiple durable experience entries, and prefer corroboration across projects when it is available.',
+    '- For single-project evidence, apply a stricter abstraction check: the principle must still be actionable after every project-specific noun and implementation detail is removed.',
+    '- The result must remain useful after project names, frameworks, paths, vendors, and product details are removed.',
+    '- State when the principle applies, the preferred decision or action, and how to verify it when useful.',
+    '- Do not promote environment facts, commands, repository conventions, incidents, or project-specific recipes.',
+    '- Prefer one concise principle over several overlapping entries. Replace or remove stale global entries only when the project corpus provides clear evidence.',
+    '- Keep each entry declarative and under 220 characters.',
+    '- No tool call is better than a forced abstraction.',
+    '',
+    'If no update is warranted, do not call any tool. Reply exactly: No global memory changes.',
   ].join('\n')
 }
 
@@ -468,7 +527,9 @@ function denyPromptMemoryReviewTool(tool: Tool, reason: string) {
   }
 }
 
-function createPromptMemoryReviewCanUseTool(): CanUseToolFn {
+function createPromptMemoryReviewCanUseTool(
+  allowedTargets: ReadonlySet<PromptMemoryEntryTarget>,
+): CanUseToolFn {
   return async (tool, input) => {
     if (tool.name !== PROMPT_MEMORY_TOOL_NAME) {
       return denyPromptMemoryReviewTool(
@@ -479,20 +540,37 @@ function createPromptMemoryReviewCanUseTool(): CanUseToolFn {
 
     const action = input.action
     const target = input.target
-    if (action === 'status' || action === 'read') {
+    if (
+      action === 'status' ||
+      (action === 'read' &&
+        typeof target === 'string' &&
+        allowedTargets.has(target as PromptMemoryEntryTarget))
+    ) {
       return { behavior: 'allow' as const, updatedInput: input }
     }
     if (
       (action === 'add' || action === 'replace' || action === 'remove') &&
-      (target === 'brief' || target === 'user')
+      typeof target === 'string' &&
+      allowedTargets.has(target as PromptMemoryEntryTarget)
     ) {
       return { behavior: 'allow' as const, updatedInput: input }
     }
 
     return denyPromptMemoryReviewTool(
       tool,
-      'Automatic prompt-memory review may only add, replace, or remove BRIEF.md/USER.md entries.',
+      `Automatic prompt-memory review may only modify: ${[...allowedTargets].join(', ')}.`,
     )
+  }
+}
+
+function createPromptMemoryWorkerOptions(context: REPLHookContext) {
+  return {
+    ...context.toolUseContext.options,
+    commands: [],
+    tools: [PromptMemoryTool],
+    mcpClients: [],
+    mcpResources: {},
+    refreshTools: undefined,
   }
 }
 
@@ -535,7 +613,9 @@ function coerceMutationAction(value: unknown): PromptMemoryAction | null {
 }
 
 function coerceEntryTarget(value: unknown): PromptMemoryEntryTarget | null {
-  return value === 'brief' || value === 'user' ? value : null
+  return value === 'brief' || value === 'project' || value === 'user'
+    ? value
+    : null
 }
 
 function truncateLogText(text: string | undefined): string | undefined {
@@ -665,10 +745,62 @@ export function formatPromptMemoryAutoReviewNotice(
 
   const parts: string[] = []
   const userCount = entries.filter(entry => entry.target === 'user').length
-  const methodCount = entries.filter(entry => entry.target === 'brief').length
+  const projectCount = entries.filter(entry => entry.target === 'project').length
+  const globalCount = entries.filter(entry => entry.target === 'brief').length
   if (userCount > 0) parts.push(`对你的了解${userCount > 1 ? `（${userCount} 条）` : ''}`)
-  if (methodCount > 0) parts.push(`做事方法${methodCount > 1 ? `（${methodCount} 条）` : ''}`)
+  if (projectCount > 0) {
+    parts.push(`项目经验${projectCount > 1 ? `（${projectCount} 条）` : ''}`)
+  }
+  if (globalCount > 0) {
+    parts.push(`全局方法${globalCount > 1 ? `（${globalCount} 条）` : ''}`)
+  }
   return `自进化记忆已更新：${parts.join(' / ')}，将在新会话生效。可在「记忆」中查看和修改。`
+}
+
+async function runPromptMemoryWorker(params: {
+  context: REPLHookContext
+  prompt: string
+  allowedTargets: ReadonlySet<PromptMemoryEntryTarget>
+  trigger: ReviewTrigger
+  maxTurns: number
+  isolated?: boolean
+}): Promise<PromptMemoryAutoReviewLogEntry[]> {
+  const baseCacheParams = createCacheSafeParams(params.context)
+  const cacheSafeParams = params.isolated
+    ? {
+        ...baseCacheParams,
+        systemPrompt: asSystemPrompt([
+          'You are a background memory-maintenance worker. Follow the supplied maintenance prompt and use only the provided memory tool.',
+        ]),
+        userContext: {},
+        systemContext: {},
+        forkContextMessages: [],
+      }
+    : baseCacheParams
+
+  const result = await runForkedAgent({
+    promptMessages: [createUserMessage({ content: params.prompt })],
+    cacheSafeParams,
+    canUseTool: createPromptMemoryReviewCanUseTool(params.allowedTargets),
+    querySource: 'prompt_memory_review' as QuerySource,
+    forkLabel:
+      params.trigger === 'meta'
+        ? 'prompt_memory_global_review'
+        : 'prompt_memory_review',
+    overrides: {
+      options: createPromptMemoryWorkerOptions(params.context),
+      requireCanUseTool: true,
+    },
+    skipTranscript: true,
+    skipCacheWrite: true,
+    maxTurns: params.maxTurns,
+  })
+
+  return extractPromptMemoryAutoReviewLogs({
+    messages: result.messages,
+    sessionId: getSessionId(),
+    trigger: params.trigger,
+  })
 }
 
 async function runPromptMemoryAutoReview({
@@ -691,54 +823,69 @@ async function runPromptMemoryAutoReview({
 
   inProgress = true
   try {
-    const [brief, user, reviewState] = await Promise.all([
+    const [brief, project, user, reviewState] = await Promise.all([
       readPromptMemoryFile('brief'),
+      readPromptMemoryFile('project'),
       readPromptMemoryFile('user'),
       readPromptMemoryAutoReviewState(),
     ])
-    const reviewPlan = planPromptMemoryReview({
-      trigger,
-      state: reviewState,
-      memoryEntryCount: brief.entries.length + user.entries.length,
-      metaInterval: getMetaReviewInterval(),
-    })
-    const effectiveTrigger = reviewPlan.trigger
 
     const prompt = buildPromptMemoryAutoReviewPrompt({
       newMessageCount: newVisibleMessages,
-      trigger: effectiveTrigger,
+      trigger,
       briefEntries: brief.entries,
+      projectEntries: project.entries,
       userEntries: user.entries,
       preferredLanguage: getConfiguredPromptMemoryLanguage(),
     })
 
-    const result = await runForkedAgent({
-      promptMessages: [createUserMessage({ content: prompt })],
-      cacheSafeParams: createCacheSafeParams(context),
-      canUseTool: createPromptMemoryReviewCanUseTool(),
-      querySource: 'prompt_memory_review' as QuerySource,
-      forkLabel: 'prompt_memory_review',
-      skipTranscript: true,
-      skipCacheWrite: true,
-      maxTurns: effectiveTrigger === 'meta' ? 8 : 4,
+    const primaryLogs = await runPromptMemoryWorker({
+      context,
+      prompt,
+      allowedTargets: new Set<PromptMemoryEntryTarget>(['project', 'user']),
+      trigger,
+      maxTurns: 4,
+    })
+    await appendPromptMemoryAutoReviewLogs(primaryLogs)
+
+    const corpus = await collectProjectExperienceCorpus()
+    const reviewPlan = planPromptMemoryReview({
+      state: reviewState,
+      periodicReview: trigger === 'interval',
+      projectCount: corpus.projectCount,
+      projectEntryCount: corpus.entryCount,
+      corpusFingerprint: corpus.fingerprint,
+      metaInterval: getMetaReviewInterval(),
     })
 
-    const logEntries = extractPromptMemoryAutoReviewLogs({
-      messages: result.messages,
-      sessionId: getSessionId(),
-      trigger: effectiveTrigger,
-    })
-    await appendPromptMemoryAutoReviewLogs(logEntries)
-    if (trigger === 'interval') {
-      try {
-        await writePromptMemoryAutoReviewState(reviewPlan.nextState)
-      } catch (stateError) {
-        logForDebugging(
-          `[prompt-memory-review] failed to persist meta-review state: ${errorMessage(stateError)}`,
-          { level: 'debug' },
-        )
-      }
+    const logEntries = [...primaryLogs]
+    if (reviewPlan.runGlobalReview) {
+      const globalPrompt = buildGlobalPromptMemoryReviewPrompt({
+        corpus,
+        briefEntries: brief.entries,
+        preferredLanguage: getConfiguredPromptMemoryLanguage(),
+      })
+      const globalLogs = await runPromptMemoryWorker({
+        context,
+        prompt: globalPrompt,
+        allowedTargets: new Set<PromptMemoryEntryTarget>(['brief']),
+        trigger: 'meta',
+        maxTurns: 8,
+        isolated: true,
+      })
+      await appendPromptMemoryAutoReviewLogs(globalLogs)
+      logEntries.push(...globalLogs)
     }
+
+    try {
+      await writePromptMemoryAutoReviewState(reviewPlan.nextState)
+    } catch (stateError) {
+      logForDebugging(
+        `[prompt-memory-review] failed to persist global-review state: ${errorMessage(stateError)}`,
+        { level: 'debug' },
+      )
+    }
+
     const notice = formatPromptMemoryAutoReviewNotice(logEntries)
     if (notice) {
       context.toolUseContext.appendSystemMessage?.(
@@ -754,7 +901,7 @@ async function runPromptMemoryAutoReview({
     if (lastMessage?.uuid) lastReviewedMessageUuid = lastMessage.uuid
 
     logForDebugging(
-      `[prompt-memory-review] finished (${effectiveTrigger}${isTrailingRun ? ', trailing' : ''}): ${summarizeLogEntries(logEntries)}`,
+      `[prompt-memory-review] finished (${trigger}${reviewPlan.runGlobalReview ? ', global' : ''}${isTrailingRun ? ', trailing' : ''}): ${summarizeLogEntries(logEntries)}`,
     )
   } catch (error) {
     logForDebugging(
@@ -840,5 +987,6 @@ export const promptMemoryAutoReviewPathsForTesting = {
   getAutoReviewLogPath,
   getAutoReviewStatePath,
   getBriefPath,
+  getProjectExperiencePath,
   getUserPromptMemoryPath,
 }

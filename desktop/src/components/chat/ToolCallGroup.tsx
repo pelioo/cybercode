@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { ToolCallBlock } from './ToolCallBlock'
 import { MarkdownRenderer } from '../markdown/MarkdownRenderer'
 import { Modal } from '../shared/Modal'
@@ -8,6 +8,7 @@ import type { AgentTaskNotification, UIMessage } from '../../types/chat'
 import { AGENT_LIFECYCLE_TYPES } from '../../types/team'
 import { isAgentLaunchResult } from '../../utils/toolCallState'
 import { Icon } from '../shared/Icon'
+import { CHAT_ACTIVITY_BODY_MAX_HEIGHT_CLASS } from './activityPanelLayout'
 
 type ToolCall = Extract<UIMessage, { type: 'tool_use' }>
 type ToolResult = Extract<UIMessage, { type: 'tool_result' }>
@@ -26,6 +27,7 @@ type Props = {
 const READ_TOOL_NAMES = new Set(['read'])
 const COMMAND_TOOL_NAMES = new Set(['bash'])
 const MODIFY_TOOL_NAMES = new Set(['edit', 'write', 'notebookedit', 'multiedit'])
+const AUTO_FOLLOW_THRESHOLD = 12
 
 function normalizedToolName(toolName: string): string {
   return toolName.replace(/[^a-z]/gi, '').toLowerCase()
@@ -130,8 +132,14 @@ function UnifiedToolGroup({
 }: Props) {
   const t = useTranslation()
   const [manualOverride, setManualOverride] = useState<boolean | null>(null)
-  const { toolCalls: allToolCalls, filesRead, commandsRun, filesModified } =
-    getActivityCounts(toolCalls, childToolCallsByParent)
+  const detailsRef = useRef<HTMLDivElement>(null)
+  const detailsContentRef = useRef<HTMLDivElement>(null)
+  const shouldAutoFollowRef = useRef(true)
+  const scrollFrameRef = useRef<number | null>(null)
+  const { toolCalls: allToolCalls, filesRead, commandsRun, filesModified } = useMemo(
+    () => getActivityCounts(toolCalls, childToolCallsByParent),
+    [childToolCallsByParent, toolCalls],
+  )
   const isAgentActivityActive = Boolean(isStreaming) || Boolean(isTurnActive)
   const hasRunningAgent = allToolCalls.some((toolCall) => {
     if (normalizedToolName(toolCall.toolName) !== 'agent') return false
@@ -149,11 +157,75 @@ function UnifiedToolGroup({
   const isExecuting = Boolean(isStreaming) || hasRunningAgent
   const expanded = Boolean(isTurnActive) || (manualOverride ?? isExecuting)
 
+  const scrollToBottom = useCallback(() => {
+    const details = detailsRef.current
+    if (!details) return
+    details.scrollTop = details.scrollHeight
+  }, [])
+
+  const scheduleScrollToBottom = useCallback(() => {
+    if (scrollFrameRef.current !== null) return
+    scrollFrameRef.current = requestAnimationFrame(() => {
+      scrollFrameRef.current = null
+      scrollToBottom()
+    })
+  }, [scrollToBottom])
+
   // Each new turn starts from the automatic expanded state. While that turn is
   // active, individual tool waves must not collapse the activity history.
   useEffect(() => {
     if (isTurnActive) setManualOverride(null)
   }, [isTurnActive])
+
+  useLayoutEffect(() => {
+    if (!expanded) return
+    shouldAutoFollowRef.current = true
+    scheduleScrollToBottom()
+  }, [expanded, scheduleScrollToBottom])
+
+  useEffect(() => {
+    if (!expanded || !shouldAutoFollowRef.current) return
+    scheduleScrollToBottom()
+  }, [
+    agentTaskNotifications,
+    allToolCalls.length,
+    childToolCallsByParent,
+    expanded,
+    resultMap,
+    scheduleScrollToBottom,
+  ])
+
+  useLayoutEffect(() => {
+    if (
+      !expanded
+      || (!isExecuting && !isTurnActive)
+      || typeof ResizeObserver === 'undefined'
+    ) return
+    const contentNode = detailsContentRef.current
+    if (!contentNode) return
+
+    const observer = new ResizeObserver(() => {
+      if (shouldAutoFollowRef.current) scheduleScrollToBottom()
+    })
+    observer.observe(contentNode)
+    return () => observer.disconnect()
+  }, [expanded, isExecuting, isTurnActive, scheduleScrollToBottom])
+
+  useEffect(() => () => {
+    if (scrollFrameRef.current === null) return
+    cancelAnimationFrame(scrollFrameRef.current)
+    scrollFrameRef.current = null
+  }, [])
+
+  const handleDetailsScroll = () => {
+    const details = detailsRef.current
+    if (!details) return
+
+    const distanceFromBottom = details.scrollHeight - details.scrollTop - details.clientHeight
+    if (distanceFromBottom <= AUTO_FOLLOW_THRESHOLD) {
+      shouldAutoFollowRef.current = true
+    }
+  }
 
   const allComplete = allToolCalls.every((toolCall) => resultMap.has(toolCall.toolUseId))
   const errorPresent = groupHasErrors(allToolCalls, resultMap)
@@ -200,7 +272,10 @@ function UnifiedToolGroup({
         aria-expanded={expanded}
         aria-disabled={isTurnActive ? 'true' : undefined}
         onClick={() => {
-          if (!isTurnActive) setManualOverride(!expanded)
+          if (!isTurnActive) {
+            if (!expanded) shouldAutoFollowRef.current = true
+            setManualOverride(!expanded)
+          }
         }}
         className="flex h-[44px] w-full items-center justify-center gap-[8px] px-[16px] text-center transition-colors hover:bg-[var(--color-surface-hover)]/45"
       >
@@ -247,32 +322,48 @@ function UnifiedToolGroup({
 
       {expanded && (
         <div
+          ref={detailsRef}
           data-tool-activity-details
-          className="scrollbar-no-track max-h-[284px] space-y-2 overflow-y-auto border-t border-[var(--color-border-separator)]/45 px-4 py-3"
+          className={`scrollbar-no-track ${CHAT_ACTIVITY_BODY_MAX_HEIGHT_CLASS} overflow-y-auto border-t border-[var(--color-border-separator)]/45 px-4 py-3`}
           style={{ animation: 'fade-in 200ms cubic-bezier(0.16, 1, 0.3, 1)' }}
+          onScroll={handleDetailsScroll}
+          onWheelCapture={(event) => {
+            const details = detailsRef.current
+            if (event.deltaY < 0 && details && details.scrollHeight > details.clientHeight) {
+              shouldAutoFollowRef.current = false
+            }
+          }}
+          onTouchMoveCapture={() => {
+            const details = detailsRef.current
+            if (details && details.scrollHeight > details.clientHeight) {
+              shouldAutoFollowRef.current = false
+            }
+          }}
         >
-          {toolCalls.map((toolCall) => (
-            toolCall.toolName === 'Agent' ? (
-              <AgentCallCard
-                key={toolCall.id}
-                toolCall={toolCall}
-                resultMap={resultMap}
-                childToolCallsByParent={childToolCallsByParent}
-                agentTaskNotification={agentTaskNotifications[toolCall.toolUseId]}
-                isStreaming={isAgentActivityActive}
-              />
-            ) : (
-              <div key={toolCall.id}>
-                <ToolCallTree
+          <div ref={detailsContentRef} className="space-y-2">
+            {toolCalls.map((toolCall) => (
+              toolCall.toolName === 'Agent' ? (
+                <AgentCallCard
+                  key={toolCall.id}
                   toolCall={toolCall}
                   resultMap={resultMap}
                   childToolCallsByParent={childToolCallsByParent}
-                  isActive={isExecuting}
-                  compact
+                  agentTaskNotification={agentTaskNotifications[toolCall.toolUseId]}
+                  isStreaming={isAgentActivityActive}
                 />
-              </div>
-            )
-          ))}
+              ) : (
+                <div key={toolCall.id}>
+                  <ToolCallTree
+                    toolCall={toolCall}
+                    resultMap={resultMap}
+                    childToolCallsByParent={childToolCallsByParent}
+                    isActive={isExecuting}
+                    compact
+                  />
+                </div>
+              )
+            ))}
+          </div>
         </div>
       )}
       </div>

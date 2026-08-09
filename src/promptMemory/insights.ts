@@ -8,6 +8,8 @@ export const PROMPT_MEMORY_INSIGHT_CATEGORIES = [
   'quality',
   'boundaries',
   'expertise',
+  'project-method',
+  'decision',
   'meta-method',
   'environment',
   'lesson',
@@ -21,7 +23,7 @@ export type PromptMemoryInsightSource = 'explicit' | 'observed' | 'manual'
 
 export type PromptMemoryInsight = {
   id: string
-  target: 'user' | 'brief'
+  target: 'user' | 'project' | 'brief'
   category: PromptMemoryInsightCategory
   content: string
   raw: string
@@ -34,6 +36,8 @@ export type PromptMemoryInsights = {
   stats: {
     total: number
     user: number
+    project: number
+    globalMethods: number
     methods: number
     dimensions: number
     automaticUpdates: number
@@ -45,7 +49,7 @@ type InsightFile = { entries: string[] }
 type InsightLog = {
   timestamp: string
   trigger: 'explicit' | 'interval' | 'meta'
-  target: 'user' | 'brief'
+  target: 'user' | 'project' | 'brief'
   changed: boolean
   content?: string
 }
@@ -117,6 +121,10 @@ function inferUserCategory(entry: string): PromptMemoryInsightCategory {
 }
 
 function inferBriefCategory(entry: string): PromptMemoryInsightCategory {
+  return 'meta-method'
+}
+
+function inferProjectCategory(entry: string): PromptMemoryInsightCategory {
   const text = entry.toLowerCase()
   if (
     /(?:\b(?:environment|path|directory|terminal|shell|provider|model|runtime|bun|node|rust)\b|环境|路径|目录|终端|模型|厂商|运行时|環境|パス|モデル|환경|경로|모델)/i.test(
@@ -126,29 +134,41 @@ function inferBriefCategory(entry: string): PromptMemoryInsightCategory {
     return 'environment'
   }
   if (
+    /(?:\b(?:decision|decided|choose|chosen|trade-?off|rationale)\b|决定|决策|选择|取舍|原因|決定|選択|결정|선택)/i.test(
+      text,
+    )
+  ) {
+    return 'decision'
+  }
+  if (
     /(?:\b(?:pitfall|failure|failed|error|lesson|avoid|regression|incident)\b|踩坑|失败|错误|教训|回归|事故|落とし穴|失敗|教訓|실패|교훈)/i.test(
       text,
     )
   ) {
     return 'lesson'
   }
-  return 'meta-method'
+  return 'project-method'
 }
 
 export function parsePromptMemoryInsight(
   entry: string,
-  target: 'user' | 'brief',
+  target: 'user' | 'project' | 'brief',
 ): Pick<PromptMemoryInsight, 'category' | 'content' | 'raw'> {
   const raw = entry.trim()
-  const category = taggedCategory(raw) ??
-    (target === 'user' ? inferUserCategory(raw) : inferBriefCategory(raw))
+  const category =
+    taggedCategory(raw) ??
+    (target === 'user'
+      ? inferUserCategory(raw)
+      : target === 'project'
+        ? inferProjectCategory(raw)
+        : inferBriefCategory(raw))
   const content = taggedCategory(raw)
     ? raw.replace(CATEGORY_TAG_PATTERN, '').trim()
     : raw
   return { category, content, raw }
 }
 
-function insightId(target: 'user' | 'brief', raw: string): string {
+function insightId(target: 'user' | 'project' | 'brief', raw: string): string {
   return createHash('sha256')
     .update(`${target}\0${raw}`)
     .digest('hex')
@@ -157,7 +177,7 @@ function insightId(target: 'user' | 'brief', raw: string): string {
 
 function findMatchingLog(
   logs: InsightLog[],
-  target: 'user' | 'brief',
+  target: 'user' | 'project' | 'brief',
   raw: string,
 ): InsightLog | undefined {
   return logs.find(log =>
@@ -168,12 +188,12 @@ function findMatchingLog(
 }
 
 export function buildPromptMemoryInsights(params: {
-  files: { user: InsightFile; brief: InsightFile }
+  files: { user: InsightFile; project: InsightFile; brief: InsightFile }
   logs: InsightLog[]
 }): PromptMemoryInsights {
   const insights: PromptMemoryInsight[] = []
 
-  for (const target of ['user', 'brief'] as const) {
+  for (const target of ['user', 'project', 'brief'] as const) {
     for (const entry of params.files[target].entries) {
       const parsed = parsePromptMemoryInsight(entry, target)
       if (!parsed.content) continue
@@ -193,12 +213,18 @@ export function buildPromptMemoryInsights(params: {
   }
 
   const user = insights.filter(insight => insight.target === 'user').length
-  const methods = insights.length - user
+  const project = insights.filter(insight => insight.target === 'project').length
+  const globalMethods = insights.filter(
+    insight => insight.target === 'brief',
+  ).length
+  const methods = project + globalMethods
   return {
     insights,
     stats: {
       total: insights.length,
       user,
+      project,
+      globalMethods,
       methods,
       dimensions: new Set(insights.map(insight => insight.category)).size,
       automaticUpdates: params.logs.filter(log => log.changed).length,

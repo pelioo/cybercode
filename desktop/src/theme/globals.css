@@ -798,13 +798,16 @@ html[data-runtime="tauri"] #root {
   visibility: hidden;
   pointer-events: none;
   transition:
-    opacity 150ms cubic-bezier(0.4, 0, 0.2, 1),
-    visibility 0s linear 150ms;
+    opacity 80ms cubic-bezier(0.2, 0, 0, 1),
+    visibility 0s linear 80ms;
 }
 
 .message-action-visibility[data-actions-visible="true"] {
   opacity: 1;
   visibility: visible;
+  transition:
+    opacity 60ms cubic-bezier(0.2, 0, 0, 1),
+    visibility 0s linear 0s;
   transition-delay: 0s;
 }
 

@@ -1,8 +1,11 @@
 export const SOUL_CHAR_LIMIT = 3000
 export const BRIEF_CHAR_LIMIT = 2200
+export const PROJECT_EXPERIENCE_CHAR_LIMIT = 2200
 export const USER_PROMPT_MEMORY_CHAR_LIMIT = 1375
 export const PROMPT_MEMORY_TOTAL_CHAR_LIMIT =
-  BRIEF_CHAR_LIMIT + USER_PROMPT_MEMORY_CHAR_LIMIT
+  BRIEF_CHAR_LIMIT +
+  PROJECT_EXPERIENCE_CHAR_LIMIT +
+  USER_PROMPT_MEMORY_CHAR_LIMIT
 
 export type BoundedText = {
   content: string
@@ -51,4 +54,28 @@ export function boundPromptMemoryPair(params: {
   const userLimit = Math.min(USER_PROMPT_MEMORY_CHAR_LIMIT, remainingForUser)
   const user = boundPromptMemoryText('USER.md', params.user, userLimit)
   return { brief, user }
+}
+
+export function boundPromptMemorySet(params: {
+  brief: string
+  project: string
+  user: string
+}): {
+  brief: BoundedText
+  project: BoundedText
+  user: BoundedText
+} {
+  return {
+    brief: boundPromptMemoryText('BRIEF.md', params.brief, BRIEF_CHAR_LIMIT),
+    project: boundPromptMemoryText(
+      'PROJECT_EXPERIENCE.md',
+      params.project,
+      PROJECT_EXPERIENCE_CHAR_LIMIT,
+    ),
+    user: boundPromptMemoryText(
+      'USER.md',
+      params.user,
+      USER_PROMPT_MEMORY_CHAR_LIMIT,
+    ),
+  }
 }

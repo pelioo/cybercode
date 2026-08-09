@@ -161,10 +161,10 @@ import {
 import type { QuerySource } from '../constants/querySource.js'
 import {
   getDeferredToolsDelta,
+  getToolSearchTransport,
   isDeferredToolsDeltaEnabled,
   isToolSearchEnabledOptimistic,
   isToolSearchToolAvailable,
-  modelSupportsToolReference,
   type DeferredToolsDeltaScanContext,
 } from './toolSearch.js'
 import {
@@ -1463,9 +1463,14 @@ export function getDeferredToolsDeltaAttachment(
   // is filtered out, but that's a narrow case and the tools announced
   // are directly callable anyway.
   if (!isToolSearchEnabledOptimistic()) return []
-  if (!modelSupportsToolReference(model)) return []
   if (!isToolSearchToolAvailable(tools)) return []
-  const delta = getDeferredToolsDelta(tools, messages ?? [], scanContext)
+  const protocol = getToolSearchTransport(model)
+  const delta = getDeferredToolsDelta(
+    tools,
+    messages ?? [],
+    scanContext,
+    protocol,
+  )
   if (!delta) return []
   return [{ type: 'deferred_tools_delta', ...delta }]
 }
@@ -1555,7 +1560,7 @@ export function getAgentListingDeltaAttachment(
 export function getMcpInstructionsDeltaAttachment(
   mcpClients: MCPServerConnection[],
   tools: Tools,
-  model: string,
+  _model: string,
   messages: Message[] | undefined,
 ): Attachment[] {
   if (!isMcpInstructionsDeltaEnabled()) return []
@@ -1566,7 +1571,6 @@ export function getMcpInstructionsDeltaAttachment(
   const clientSide: ClientSideInstruction[] = []
   if (
     isToolSearchEnabledOptimistic() &&
-    modelSupportsToolReference(model) &&
     isToolSearchToolAvailable(tools)
   ) {
     clientSide.push({

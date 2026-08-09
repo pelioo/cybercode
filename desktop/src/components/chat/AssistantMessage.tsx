@@ -79,8 +79,6 @@ export function AssistantMessage({
       >
         <div
           data-message-row="assistant"
-          onPointerEnter={showActions}
-          onPointerLeave={scheduleHideActions}
           className="flex w-full items-end justify-start gap-[8px]"
         >
           <div

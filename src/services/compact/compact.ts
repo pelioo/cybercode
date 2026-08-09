@@ -605,9 +605,8 @@ export async function compactConversation(
       preCompactTokenCount ?? 0,
       messages.at(-1)?.uuid,
     )
-    // Carry loaded-tool state — the summary doesn't preserve tool_reference
-    // blocks, so the post-compact schema filter needs this to keep sending
-    // already-loaded deferred tool schemas to the API.
+    // Carry native references and local discovery markers across compaction so
+    // the post-compact schema filter keeps already-loaded tools available.
     const preCompactDiscovered = extractDiscoveredToolNames(messages)
     if (preCompactDiscovered.size > 0) {
       boundaryMarker.compactMetadata.preCompactDiscoveredTools = [
@@ -1275,10 +1274,8 @@ async function streamCompactSummary({
         'compact',
       )
 
-      // When tool search is enabled, include ToolSearchTool and MCP tools. They get
-      // defer_loading: true and don't count against context - the API filters them out
-      // of system_prompt_tools before token counting (see api/token_count_api/counting.py:188
-      // and api/public_api/messages/handler.py:324).
+      // Include ToolSearchTool and MCP tools in the candidate pool. queryModel
+      // applies native defer_loading or provider-neutral local filtering.
       // Filter MCP tools from context.options.tools (not appState.mcp.tools) so we
       // get the permission-filtered set from useMergedTools — same source used for
       // isToolSearchEnabled above and normalizeMessagesForAPI below.

@@ -11,7 +11,6 @@ import { NotebookEditTool } from './tools/NotebookEditTool/NotebookEditTool.js'
 import { WebFetchTool } from './tools/WebFetchTool/WebFetchTool.js'
 import { TaskStopTool } from './tools/TaskStopTool/TaskStopTool.js'
 import { BriefTool } from './tools/BriefTool/BriefTool.js'
-import { PromptMemoryTool } from './tools/PromptMemoryTool/PromptMemoryTool.js'
 import { SessionSearchTool } from './tools/SessionSearchTool/SessionSearchTool.js'
 import { SkillGateTool } from './tools/SkillGateTool/SkillGateTool.js'
 import { SkillMemoryTool } from './tools/SkillMemoryTool/SkillMemoryTool.js'
@@ -217,7 +216,6 @@ export function getAllBaseTools(): Tools {
     TodoWriteTool,
     GoalStatusTool,
     WebSearchTool,
-    PromptMemoryTool,
     SessionSearchTool,
     SkillGateTool,
     SkillMemoryTool,

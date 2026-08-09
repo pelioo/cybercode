@@ -19,6 +19,8 @@ import { isKimiK3ModelId } from '../../../utils/model/thinkingPolicy.js'
 export type OpenAIChatTransformOptions = {
   kimiThinking?: boolean
   preserveReasoningContent?: boolean
+  promptCacheKey?: string
+  includeStreamUsage?: boolean
 }
 
 /** Convert an Anthropic request to OpenAI Chat Completions. */
@@ -48,6 +50,12 @@ export function anthropicToOpenaiChat(
     model: body.model,
     messages,
     stream: body.stream,
+    ...(options.promptCacheKey && {
+      prompt_cache_key: options.promptCacheKey,
+    }),
+    ...(body.stream && options.includeStreamUsage && {
+      stream_options: { include_usage: true },
+    }),
   }
 
   // Preserve deliberately small internal calls while still omitting the very

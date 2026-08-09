@@ -17,6 +17,10 @@ vi.mock('../api/sessions', () => ({
 }))
 
 import { useSessionStore } from './sessionStore'
+import {
+  NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY,
+  useSessionRuntimeStore,
+} from './sessionRuntimeStore'
 import { useSettingsStore } from './settingsStore'
 
 const initialState = useSessionStore.getState()
@@ -44,6 +48,7 @@ describe('sessionStore', () => {
       projectDisplayNames: {},
     })
     useSettingsStore.setState({ locale: 'zh' })
+    useSessionRuntimeStore.setState({ selections: {} })
   })
 
   afterEach(() => {
@@ -100,6 +105,31 @@ describe('sessionStore', () => {
       workDir: '/Users/test',
       isTemporary: true,
     })
+  })
+
+  it('copies the configured runtime default into every newly created session', async () => {
+    const defaultSelection = {
+      kind: 'route' as const,
+      providerId: null,
+      routeId: 'coding-route',
+      modelId: 'cybercode-route-coding-route',
+      contextWindow: 262_144,
+    }
+    useSessionRuntimeStore.getState().setSelection(
+      NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY,
+      defaultSelection,
+    )
+    createMock.mockResolvedValue({ sessionId: 'session-with-runtime-default' })
+    listMock.mockImplementation(() => new Promise(() => {}))
+
+    await useSessionStore.getState().createSession({ temporary: true })
+
+    expect(
+      useSessionRuntimeStore.getState().selections['session-with-runtime-default'],
+    ).toEqual(defaultSelection)
+    expect(
+      useSessionRuntimeStore.getState().selections[NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY],
+    ).toEqual(defaultSelection)
   })
 
   it('excludes temporary sessions from available projects after refresh', async () => {

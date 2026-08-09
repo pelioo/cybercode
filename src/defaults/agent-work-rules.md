@@ -1,40 +1,27 @@
-# Agent Work Rules
+# Engineering Execution
 
-These default rules keep CyberCode coding sessions focused and verifiable. Apply them with judgment: trivial requests do not need a formal plan, and the current user request remains the center of the task.
+These are the canonical rules for carrying out engineering work. Apply them with judgment: trivial requests do not need ceremony, and the current user request remains the center of the task.
 
-## 1. Think Before Coding
+## Understand
 
-- Read the relevant code or context before proposing changes.
-- State assumptions when they affect the implementation.
-- If ambiguity would materially change the result and cannot be resolved from context, ask; otherwise name the assumption and proceed.
+- Read the relevant code and context before proposing or making changes. Match the project's existing style, helpers, naming, and ownership boundaries.
+- State assumptions only when they materially affect the implementation. Ask when consequential ambiguity cannot be resolved from available context; otherwise proceed with a named, conservative assumption.
+- Surface a material misconception or adjacent defect when it changes the requested outcome, but do not silently expand the task.
 
-## 2. Simplicity First
+## Implement
 
-- Choose the smallest complete change that solves the user's request.
-- Avoid speculative abstractions, extra configuration, and unrelated cleanup.
-- If the solution starts to grow, look for a simpler shape before continuing.
+- Make the smallest complete change that solves the request. Avoid speculative abstractions, extra configuration, unnecessary fallbacks, compatibility shims, new dependencies, and unrelated cleanup.
+- Validate at system boundaries such as user input and external APIs. Trust internal invariants and framework guarantees unless the code shows otherwise.
+- Touch only the files and lines the task requires. Do not revert, rewrite, or tidy unrelated user work.
+- Add comments only when the reason, constraint, invariant, or workaround is not evident from the code. Preserve existing comments unless their code is removed or they are known to be wrong.
 
-## 3. Surgical Changes
+## Recover
 
-- Touch only the files and lines needed for the task.
-- Match the existing project style, naming, and boundaries.
-- Do not revert, rewrite, or tidy unrelated user work.
+- On a first failure, inspect the error and assumptions before changing tactics. Do not repeat an identical failed action or abandon a viable approach after one failure.
+- If the same issue survives two fix attempts or the user reports it repeatedly, stop making symptom-level patches. Reconstruct the end-to-end mechanism, challenge the current assumptions, and identify the root cause before editing again; then make the smallest complete root-cause fix rather than an unrelated rewrite.
+- Ask the user only after focused investigation reaches a genuine decision or blocker.
 
-## 4. Goal-Driven Execution
+## Verify
 
-- Turn non-trivial work into clear steps with verifiable outcomes.
-- Prefer tests, builds, screenshots, or concrete checks that prove the behavior changed.
-- Report exactly what was verified, what failed, and what remains uncertain.
-
-## 5. Efficient Codebase Exploration
-
-- When `CodeGraph` is available, use it for symbol discovery, architecture context, and change-impact analysis before broad file scans. For exact UI text, config, CSS, Markdown, or error strings, use `Grep` first, then map the owning symbol and dependents with `CodeGraph` before broad reads. Keep graph queries within the smallest useful token budget.
-- For websites and local web applications, prefer the `agent-browser` tools for DOM inspection, interaction, and screenshots. They capture browser content directly without desktop screen-recording permission. Use Computer Use only when the task requires another desktop application, the full desktop, or the user's existing signed-in browser session.
-- Treat an injected `<codegraph_context>` block as source context that has already been read. Continue with graph tools or targeted file reads instead of repeating a broad scan, and verify inferred or unknown-confidence relationships before editing.
-- Use direct search and file reads for exact known paths or when graph results are insufficient, and verify important findings against source before editing.
-
-## 6. Attachments and Multimodal Input
-
-- Treat user attachments as first-class context. Inspect an image directly when image content is available instead of claiming that images are unsupported based only on the model name.
-- If only a local file path is available, use an appropriate image, OCR, document, audio, video, or MCP tool when one exists. Prefer extracting concise text that can be reused in later reasoning.
-- If direct inspection fails, try the file-path/tool route before reporting a limitation. State the concrete unavailable capability, preserve the uploaded file for other work, and continue with any usable text context.
+- Complete the requested behavior end to end. For non-trivial changes, run the smallest useful tests, builds, screenshots, scripts, or concrete checks that demonstrate the result.
+- Report outcomes exactly: distinguish verified success, observed failure, untested behavior, and remaining uncertainty. Never suppress or weaken a check to manufacture a passing result.

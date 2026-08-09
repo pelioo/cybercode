@@ -64,6 +64,9 @@ const HISTORY_PREFETCH_CACHE_MAX_BYTES = 32 * 1024 * 1024
 const HISTORY_PREFETCH_TTL_MS = 5 * 60_000
 const HISTORY_PREFETCH_TIMEOUT_MS = 4_000
 const HISTORY_PREFETCH_PROMOTION_WAIT_MS = 80
+const HISTORY_FOREGROUND_RETRY_TIMEOUT_MS = 30_000
+const HISTORY_FOREGROUND_RETRY_DELAY_MS = 150
+const ANCHOR_BACKGROUND_DELAY_MS = 300
 type HistoryPrefetchPriority = 'background' | 'recent' | 'interactive'
 const HISTORY_PREFETCH_PRIORITY: Record<HistoryPrefetchPriority, number> = {
   background: 0,
@@ -175,6 +178,8 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   historyBuffer: [],
   recentBuffer: [],
   allMessagesLoaded: false,
+  anchors: undefined,
+  anchorsLoaded: false,
   historyLoadState: 'idle',
   chatState: 'idle',
   turnCompletionPending: false,
@@ -422,27 +427,17 @@ function attachmentsForTransport(attachments?: AttachmentRef[]): AttachmentRef[]
   return attachments.map(({ previewUrl: _previewUrl, ...attachment }) => attachment)
 }
 
-function mergePendingSteers(steers: PendingSteer[]): { content: string; attachments?: AttachmentRef[] } {
-  const content = steers
-    .map((steer) => steer.content.trim())
-    .filter(Boolean)
-    .join('\n\n')
-  const attachments = steers.flatMap((steer) => pendingSteerAttachmentsToRefs(steer.attachments) ?? [])
-  return {
-    content,
-    attachments: attachments.length > 0 ? attachments : undefined,
-  }
-}
-
 const TURN_COMPLETION_SETTLE_MS = 800
 const turnCompletionIntents = new Set<string>()
 const turnCompletionTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const autoSentTurnStarts = new Map<string, number>()
 
 function clearTurnCompletionState(sessionId: string): void {
   const timer = turnCompletionTimers.get(sessionId)
   if (timer) clearTimeout(timer)
   turnCompletionTimers.delete(sessionId)
   turnCompletionIntents.delete(sessionId)
+  autoSentTurnStarts.delete(sessionId)
 }
 
 function pauseTurnCompletion(sessionId: string): void {
@@ -578,6 +573,18 @@ function isNotFoundError(error: unknown) {
   return error instanceof ApiError && error.status === 404
 }
 
+function isTransientHistoryError(error: unknown) {
+  if (error instanceof ApiError) {
+    return error.status === 408 || error.status === 429 || error.status >= 500
+  }
+  if (!(error instanceof Error) || error.name === 'AbortError') return false
+  return error instanceof TypeError || /timed out|network|connection|fetch/i.test(error.message)
+}
+
+async function waitForHistoryRetry() {
+  await new Promise<void>((resolve) => setTimeout(resolve, HISTORY_FOREGROUND_RETRY_DELAY_MS))
+}
+
 function appendAssistantTextMessage(
   messages: UIMessage[],
   content: string,
@@ -606,6 +613,68 @@ function appendAssistantTextMessage(
       ...(model ? { model } : {}),
     },
   ]
+}
+
+function applyLiveMessageWindow(
+  session: PerSessionState,
+  nextMessages: UIMessage[],
+): Pick<PerSessionState, 'messages' | 'historyBuffer' | 'allMessagesLoaded' | 'historyCursor'> {
+  if (nextMessages.length <= WINDOW_SIZE) {
+    return {
+      messages: nextMessages,
+      historyBuffer: session.historyBuffer,
+      allMessagesLoaded: session.allMessagesLoaded,
+      historyCursor: session.historyCursor,
+    }
+  }
+
+  // Preserve the whole active user turn. Raw slicing can separate a tool_use
+  // from its result or remove the prompt while the answer is still streaming.
+  let latestUserIndex = -1
+  for (let index = nextMessages.length - 1; index >= 0; index -= 1) {
+    if (nextMessages[index]?.type === 'user_text') {
+      latestUserIndex = index
+      break
+    }
+  }
+  const desiredTrimCount = Math.min(
+    nextMessages.length - WINDOW_SIZE,
+    Math.max(0, latestUserIndex),
+  )
+  let trimCount = desiredTrimCount
+  while (
+    trimCount < latestUserIndex
+    && nextMessages[trimCount]?.type !== 'user_text'
+  ) {
+    trimCount += 1
+  }
+  if (trimCount === 0) {
+    return {
+      messages: nextMessages,
+      historyBuffer: session.historyBuffer,
+      allMessagesLoaded: session.allMessagesLoaded,
+      historyCursor: session.historyCursor,
+    }
+  }
+
+  let historyBuffer = [
+    ...session.historyBuffer,
+    ...nextMessages.slice(0, trimCount),
+  ]
+  let historyCursor = session.historyCursor
+  if (historyBuffer.length > WINDOW_SIZE) {
+    historyBuffer = historyBuffer.slice(-WINDOW_SIZE)
+    // The discarded prefix remains available from the server. Let the next
+    // backward page use the first visible server id instead of a stale cursor.
+    historyCursor = undefined
+  }
+
+  return {
+    messages: nextMessages.slice(trimCount),
+    historyBuffer,
+    allMessagesLoaded: false,
+    historyCursor,
+  }
 }
 
 function createSettlingAssistant(
@@ -700,6 +769,24 @@ async function fetchAndMapSessionHistory(
     },
   )
   return request
+}
+
+async function fetchForegroundSessionHistory(
+  sessionId: string,
+  params: { limit: number; projectPath?: string },
+  isStillCurrent: () => boolean,
+): Promise<SessionHistorySnapshot> {
+  try {
+    return await fetchAndMapSessionHistory(sessionId, params)
+  } catch (error) {
+    if (!isTransientHistoryError(error) || !isStillCurrent()) throw error
+    await waitForHistoryRetry()
+    if (!isStillCurrent()) throw error
+    return fetchAndMapSessionHistory(sessionId, params, {
+      requestClass: 'foreground',
+      timeout: HISTORY_FOREGROUND_RETRY_TIMEOUT_MS,
+    })
+  }
 }
 
 type SessionHistoryCacheEntry = {
@@ -1193,6 +1280,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         timestamp: now,
         ...(isMemberSession ? { pending: true } : {}),
       })
+      const messageWindow = applyLiveMessageWindow(session, newMessages)
 
       if (!isMemberSession && session.elapsedTimer) clearInterval(session.elapsedTimer)
 
@@ -1207,7 +1295,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           ...s.sessions,
           [sessionId]: {
             ...session,
-            messages: newMessages,
+            ...messageWindow,
             chatState: 'thinking',
             turnCompletionPending: false,
             completionUnread: false,
@@ -1309,7 +1397,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const targetIds = steerIds ? new Set(steerIds) : null
     const targets = (session.pendingSteers ?? []).filter((steer) =>
       isPendingSteerActionable(steer) && (!targetIds || targetIds.has(steer.id))
-    )
+    ).slice(0, 1)
     if (targets.length === 0) return
     clearTurnCompletionState(sessionId)
     const targetIdSet = new Set(targets.map((steer) => steer.id))
@@ -1349,7 +1437,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         }
 
         return {
-          messages,
+          ...applyLiveMessageWindow(current, messages),
           streamingText,
           settlingAssistant,
           pendingSteers: (current.pendingSteers ?? []).map((steer) =>
@@ -1397,19 +1485,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   autoSendPendingSteers: (sessionId) => {
     const session = get().sessions[sessionId]
     if (!session) return
-    const targets = (session.pendingSteers ?? []).filter(isPendingSteerAutoSendable)
-    if (targets.length === 0) return
+    const target = (session.pendingSteers ?? []).find(isPendingSteerAutoSendable)
+    if (!target) return
 
-    const targetIds = new Set(targets.map((steer) => steer.id))
-    const { content, attachments } = mergePendingSteers(targets)
+    const attachments = pendingSteerAttachmentsToRefs(target.attachments)
 
     set((s) => ({
       sessions: updateSessionIn(s.sessions, sessionId, (current) => ({
-        pendingSteers: (current.pendingSteers ?? []).filter((steer) => !targetIds.has(steer.id)),
+        pendingSteers: (current.pendingSteers ?? []).filter((steer) => steer.id !== target.id),
       })),
     }))
 
-    get().sendMessage(sessionId, content, attachments)
+    get().sendMessage(sessionId, target.content.trim(), attachments)
+    const turnStartedAt = get().sessions[sessionId]?.turnStartedAt
+    if (turnStartedAt != null) autoSentTurnStarts.set(sessionId, turnStartedAt)
   },
 
   editPendingSteer: (sessionId, steerId) => {
@@ -1727,29 +1816,38 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const session = get().sessions[sessionId]
     if (!session) return
     if (!options?.force && session.anchorsLoaded) return
-    const existing = anchorsFetchRequests.get(sessionId)
+    const effectiveProjectPath = projectPath ?? session.projectPath
+    const requestKey = historyLoadKey(sessionId, effectiveProjectPath)
+    const existing = anchorsFetchRequests.get(requestKey)
     if (existing) return existing
 
-    const effectiveProjectPath = projectPath ?? session.projectPath
     const request = (async () => {
       try {
         const { anchors } = await sessionsApi.getAnchors(sessionId, { projectPath: effectiveProjectPath })
-        set((s) => ({
-          sessions: updateSessionIn(s.sessions, sessionId, () => ({ anchors, anchorsLoaded: true })),
-        }))
+        set((s) => {
+          const current = s.sessions[sessionId]
+          if (!current || (current.projectPath ?? effectiveProjectPath) !== effectiveProjectPath) return s
+          return {
+            sessions: updateSessionIn(s.sessions, sessionId, () => ({ anchors, anchorsLoaded: true })),
+          }
+        })
       } catch (err) {
         // The rail is progressive enhancement: on failure keep the UI working
         // with locally derived (loaded-window-only) anchors.
         if (!isNotFoundError(err)) console.error('[chatStore] loadAnchors failed', err)
-        set((s) => ({
-          sessions: updateSessionIn(s.sessions, sessionId, () => ({ anchorsLoaded: true })),
-        }))
+        set((s) => {
+          const current = s.sessions[sessionId]
+          if (!current || (current.projectPath ?? effectiveProjectPath) !== effectiveProjectPath) return s
+          return {
+            sessions: updateSessionIn(s.sessions, sessionId, () => ({ anchorsLoaded: true })),
+          }
+        })
       }
     })()
-    anchorsFetchRequests.set(sessionId, request)
+    anchorsFetchRequests.set(requestKey, request)
     void request.then(
-      () => { if (anchorsFetchRequests.get(sessionId) === request) anchorsFetchRequests.delete(sessionId) },
-      () => { if (anchorsFetchRequests.get(sessionId) === request) anchorsFetchRequests.delete(sessionId) },
+      () => { if (anchorsFetchRequests.get(requestKey) === request) anchorsFetchRequests.delete(requestKey) },
+      () => { if (anchorsFetchRequests.get(requestKey) === request) anchorsFetchRequests.delete(requestKey) },
     )
     return request
   },
@@ -1995,10 +2093,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         hasMessagesAfterTaskCompletion,
         hasMore,
         firstMessageId,
-      } = prefetched ?? await fetchAndMapSessionHistory(sessionId, {
-        limit: HISTORY_LOAD_LIMIT,
-        projectPath: effectiveProjectPath,
-      })
+      } = prefetched ?? await fetchForegroundSessionHistory(
+        sessionId,
+        { limit: HISTORY_LOAD_LIMIT, projectPath: effectiveProjectPath },
+        () => isCurrentHistoryLoad(sessionId, historyToken, effectiveProjectPath),
+      )
       if (!isCurrentHistoryLoad(sessionId, historyToken, effectiveProjectPath)) return
 
       set((state) => {
@@ -2044,7 +2143,6 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       })
       if (isCurrentHistoryLoad(sessionId, historyToken, effectiveProjectPath) && get().sessions[sessionId]?.historyLoadState === 'loaded') {
         finishHistoryLoad(sessionId, historyToken, effectiveProjectPath)
-        void get().loadAnchors(sessionId, effectiveProjectPath)
         if (lastTodos && lastTodos.length > 0) {
           const taskStore = useCLITaskStore.getState()
           if (taskStore.tasks.length === 0) taskStore.setTasksFromTodos(lastTodos)
@@ -2113,7 +2211,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         hasMessagesAfterTaskCompletion,
         hasMore,
         firstMessageId,
-      } = await fetchAndMapSessionHistory(sessionId, { limit: HISTORY_LOAD_LIMIT, projectPath: effectiveProjectPath })
+      } = await fetchForegroundSessionHistory(
+        sessionId,
+        { limit: HISTORY_LOAD_LIMIT, projectPath: effectiveProjectPath },
+        () => isCurrentHistoryLoad(sessionId, historyToken, effectiveProjectPath),
+      )
       if (!isCurrentHistoryLoad(sessionId, historyToken, effectiveProjectPath)) return
 
       set((state) => {
@@ -2163,7 +2265,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
       if (isCurrentHistoryLoad(sessionId, historyToken, effectiveProjectPath) && get().sessions[sessionId]?.historyLoadState === 'loaded') {
         finishHistoryLoad(sessionId, historyToken, effectiveProjectPath)
-        void get().loadAnchors(sessionId, effectiveProjectPath, { force: true })
+        setTimeout(() => {
+          const session = get().sessions[sessionId]
+          if (
+            foregroundSessionKey === historyLoadKey(sessionId, effectiveProjectPath)
+            && session
+            && (session.projectPath ?? effectiveProjectPath) === effectiveProjectPath
+          ) {
+            void get().loadAnchors(sessionId, effectiveProjectPath, { force: true })
+          }
+        }, ANCHOR_BACKGROUND_DELAY_MS)
         if (lastTodos && lastTodos.length > 0) {
           useCLITaskStore.getState().setTasksFromTodos(lastTodos)
         } else {
@@ -2256,7 +2367,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   handleServerMessage: (sessionId, msg) => {
     const update = (updater: (session: PerSessionState) => Partial<PerSessionState>) => {
-      set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, updater) }))
+      set((s) => ({
+        sessions: updateSessionIn(s.sessions, sessionId, (session) => {
+          const next = updater(session)
+          if (!next.messages) return next
+          return {
+            ...next,
+            ...applyLiveMessageWindow(session, next.messages),
+          }
+        }),
+      }))
     }
     const receivedAt = Date.now()
     const markConnectionActivity = () => ({ lastConnectionActivityAt: receivedAt })
@@ -2264,6 +2384,26 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       lastConnectionActivityAt: receivedAt,
       lastModelActivityAt: receivedAt,
     })
+    const guardedTurnStartedAt = autoSentTurnStarts.get(sessionId)
+    if (guardedTurnStartedAt != null) {
+      const session = get().sessions[sessionId]
+      const isStaleIdle = msg.type === 'status'
+        && msg.state === 'idle'
+        && session?.turnStartedAt === guardedTurnStartedAt
+        && session.lastModelActivityAt == null
+      if (isStaleIdle) {
+        update(() => markConnectionActivity())
+        return
+      }
+      if (
+        msg.type === 'message_complete'
+        || msg.type === 'generation_stopped'
+        || msg.type === 'error'
+        || isTurnActivity(msg)
+      ) {
+        autoSentTurnStarts.delete(sessionId)
+      }
+    }
     const finalizeTurn = (): boolean => {
       const session = get().sessions[sessionId]
       if (!session) return false
@@ -2287,6 +2427,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         lastModelActivityAt: null,
       }))
       useTabStore.getState().updateTabStatus(sessionId, 'idle')
+      void get().loadAnchors(sessionId, session.projectPath, { force: true })
       return true
     }
 
@@ -2679,6 +2820,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           pendingSteers: (session.pendingSteers ?? []).filter(isPendingSteerActionable),
         }))
         useTabStore.getState().updateTabStatus(sessionId, 'idle')
+        void get().loadAnchors(sessionId, session.projectPath, { force: true })
         if (shouldAutoSendPending) {
           get().autoSendPendingSteers(sessionId)
         }
@@ -2779,6 +2921,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           }
         })
         useTabStore.getState().updateTabStatus(sessionId, 'error')
+        void get().loadAnchors(sessionId, get().sessions[sessionId]?.projectPath, { force: true })
         {
           const session = get().sessions[sessionId]
           if (session?.elapsedTimer) {

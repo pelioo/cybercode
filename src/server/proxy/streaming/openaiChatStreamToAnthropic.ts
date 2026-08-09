@@ -21,6 +21,7 @@
  */
 
 import type { OpenAIChatStreamChunk } from '../transform/types.js'
+import { mapOpenAIUsage } from '../transform/openaiUsage.js'
 
 // ─── Types ─────────────────────────────────────────────────
 
@@ -530,7 +531,7 @@ function handleFinishReason(
 
   const stopReason = mapFinishReason(finishReason)
   const usage = chunk.usage
-    ? { output_tokens: chunk.usage.completion_tokens || 0 }
+    ? mapOpenAIUsage(chunk.usage)
     : { output_tokens: 0 }
 
   const messageDelta: SseEvent = {
@@ -559,7 +560,7 @@ function mergeUsageIntoHeldDelta(
   if (!state.heldMessageDelta) return
 
   const data = state.heldMessageDelta.data as Record<string, unknown>
-  data.usage = { output_tokens: usage.completion_tokens || 0 }
+  data.usage = mapOpenAIUsage(usage)
   state.messageDeltaSent = true
   state.queue.push(state.heldMessageDelta)
   state.heldMessageDelta = null

@@ -16,6 +16,14 @@ const overview: PromptMemoryInsights = {
       source: 'explicit',
     },
     {
+      id: 'project-1',
+      target: 'project',
+      category: 'decision',
+      content: 'Keep route selection in the desktop settings store.',
+      raw: '[decision] Keep route selection in the desktop settings store.',
+      source: 'observed',
+    },
+    {
       id: 'method-1',
       target: 'brief',
       category: 'meta-method',
@@ -25,11 +33,13 @@ const overview: PromptMemoryInsights = {
     },
   ],
   stats: {
-    total: 2,
+    total: 3,
     user: 1,
-    methods: 1,
-    dimensions: 2,
-    automaticUpdates: 2,
+    project: 1,
+    globalMethods: 1,
+    methods: 2,
+    dimensions: 3,
+    automaticUpdates: 3,
   },
 }
 
@@ -38,7 +48,7 @@ describe('EvolutionProfile', () => {
     useSettingsStore.setState({ locale: 'en' })
   })
 
-  it('shows user understanding and cross-task methods with provenance', () => {
+  it('separates user understanding, project experience, and global methods', () => {
     render(
       <EvolutionProfile
         overview={overview}
@@ -52,11 +62,13 @@ describe('EvolutionProfile', () => {
     expect(userHeading).toBeInTheDocument()
     expect(userHeading.className).toContain('whitespace-normal')
     expect(userHeading.className).not.toContain('truncate')
-    expect(screen.getByText('Ways of working learned')).toBeInTheDocument()
+    expect(screen.getByText('Current project experience')).toBeInTheDocument()
+    expect(screen.getByText('Cross-project global methods')).toBeInTheDocument()
     expect(screen.getByText('Identity & names')).toBeInTheDocument()
+    expect(screen.getByText('Project decision')).toBeInTheDocument()
     expect(screen.getByText('Meta method')).toBeInTheDocument()
     expect(screen.getByText('Explicit')).toBeInTheDocument()
-    expect(screen.getByText('Repeated pattern')).toBeInTheDocument()
+    expect(screen.getAllByText('Repeated pattern')).toHaveLength(2)
     expect(
       screen.getAllByRole('button', { name: 'Edit memory' })[0]?.parentElement,
     ).toHaveClass(
@@ -127,6 +139,34 @@ describe('EvolutionProfile', () => {
         target: 'user',
         category: 'collaboration',
         content: 'Ask before changing an agreed product direction.',
+        original: undefined,
+      })
+    })
+  })
+
+  it('defaults a new project entry to the project-method category', async () => {
+    const onSaveEntry = vi.fn().mockResolvedValue({ ok: true })
+    render(
+      <EvolutionProfile
+        overview={overview}
+        removingId={null}
+        onRemove={vi.fn()}
+        onSaveEntry={onSaveEntry}
+      />,
+    )
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Add memory' })[1]!)
+    expect(screen.getByLabelText('Category')).toHaveValue('project-method')
+    fireEvent.change(screen.getByLabelText('Memory'), {
+      target: { value: 'Keep provider state in the settings store.' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+
+    await waitFor(() => {
+      expect(onSaveEntry).toHaveBeenCalledWith({
+        target: 'project',
+        category: 'project-method',
+        content: 'Keep provider state in the settings store.',
         original: undefined,
       })
     })

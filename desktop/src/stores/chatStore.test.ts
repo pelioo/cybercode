@@ -120,7 +120,8 @@ vi.mock('./cliTaskStore', () => ({
   },
 }))
 
-import { mapHistoryMessagesToUiMessages, useChatStore, type PerSessionState } from './chatStore'
+import { mapHistoryMessagesToUiMessages, useChatStore, WINDOW_SIZE, type PerSessionState } from './chatStore'
+import type { UIMessage } from '../types/chat'
 
 const TEST_SESSION_ID = 'test-session-1'
 const initialState = useChatStore.getState()
@@ -781,6 +782,33 @@ describe('chatStore history mapping', () => {
     ])
   })
 
+  it('sends only the queue head when no pending steer id is provided', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSessionState({ chatState: 'streaming' }),
+      },
+    })
+
+    const firstId = useChatStore.getState().queuePendingSteer(TEST_SESSION_ID, '先处理这一条')
+    const secondId = useChatStore.getState().queuePendingSteer(TEST_SESSION_ID, '处理完再处理这一条')
+    sendMock.mockClear()
+
+    useChatStore.getState().sendPendingSteers(TEST_SESSION_ID, 'later')
+
+    expect(sendMock).toHaveBeenCalledTimes(1)
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, {
+      type: 'user_steer',
+      steerId: firstId,
+      content: '先处理这一条',
+      attachments: undefined,
+      priority: 'later',
+    })
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.pendingSteers).toMatchObject([
+      { id: firstId, status: 'queued', priority: 'later' },
+      { id: secondId, status: 'draft' },
+    ])
+  })
+
   it('keeps an immediate steer visible when the interrupted turn completes first', () => {
     useChatStore.setState({
       sessions: {
@@ -1053,7 +1081,8 @@ describe('chatStore history mapping', () => {
     ])
   })
 
-  it('auto-sends draft steering input in the user-defined order after message completion', () => {
+  it('auto-sends draft steering inputs one turn at a time in the user-defined order', () => {
+    vi.useFakeTimers()
     useChatStore.setState({
       sessions: {
         [TEST_SESSION_ID]: makeSessionState({
@@ -1095,7 +1124,7 @@ describe('chatStore history mapping', () => {
 
     expect(sendMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, {
       type: 'user_message',
-      content: '第二条补充\n\n第一条补充',
+      content: '第二条补充',
       attachments: [
         { type: 'file', name: 'notes.txt', path: '/tmp/notes.txt', data: undefined, mimeType: undefined },
       ],
@@ -1104,13 +1133,18 @@ describe('chatStore history mapping', () => {
       { type: 'assistant_text', content: '当前回复完成。' },
       {
         type: 'user_text',
-        content: '第二条补充\n\n第一条补充',
+        content: '第二条补充',
         attachments: [
           { type: 'file', name: 'notes.txt', path: '/tmp/notes.txt' },
         ],
       },
     ])
     expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.pendingSteers).toMatchObject([
+      {
+        id: 'steer-1',
+        content: '第一条补充',
+        status: 'draft',
+      },
       {
         id: 'steer-failed',
         status: 'failed',
@@ -1119,8 +1153,56 @@ describe('chatStore history mapping', () => {
     ])
     expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.chatState).toBe('thinking')
 
+    sendMock.mockClear()
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'status',
+      state: 'idle',
+    })
+    vi.advanceTimersByTime(1_000)
+
+    expect(sendMock).not.toHaveBeenCalled()
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.pendingSteers).toMatchObject([
+      { id: 'steer-1', status: 'draft' },
+      { id: 'steer-failed', status: 'failed' },
+    ])
+
+    useChatStore.setState((state) => ({
+      sessions: {
+        ...state.sessions,
+        [TEST_SESSION_ID]: {
+          ...state.sessions[TEST_SESSION_ID]!,
+          streamingText: '第二条补充已经处理完成。',
+          chatState: 'streaming',
+        },
+      },
+    }))
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'message_complete',
+      usage: { input_tokens: 12, output_tokens: 24 },
+    })
+
+    expect(sendMock).toHaveBeenCalledTimes(1)
+    expect(sendMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, {
+      type: 'user_message',
+      content: '第一条补充',
+      attachments: undefined,
+    })
+    expect(
+      useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+        .filter((message) => message.type === 'user_text')
+        .map((message) => message.content),
+    ).toEqual(['第二条补充', '第一条补充'])
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.pendingSteers).toMatchObject([
+      {
+        id: 'steer-failed',
+        status: 'failed',
+        error: 'Queue rejected',
+      },
+    ])
+
     const timer = useChatStore.getState().sessions[TEST_SESSION_ID]?.elapsedTimer
     if (timer) clearInterval(timer)
+    vi.useRealTimers()
   })
 
   it('passes the projectPath locator when loading history', async () => {
@@ -1395,6 +1477,58 @@ describe('chatStore history mapping', () => {
     expect(session?.historyLoadState).toBe('loaded')
     expect(session?.allMessagesLoaded).toBe(true)
     expect(session?.messages).toEqual([])
+  })
+
+  it('recovers from a transient foreground history timeout before showing an error', async () => {
+    const sessionId = 'transient-history-timeout-session'
+    const getMessagesMock = vi.mocked(sessionsApi.getMessages)
+    getMessagesMock.mockReset()
+    getMessagesMock
+      .mockRejectedValueOnce(new Error('Request timed out after 12s'))
+      .mockResolvedValueOnce({
+        hasMore: false,
+        messages: [{
+          id: 'recovered-after-timeout',
+          type: 'user',
+          timestamp: '2026-01-01T00:00:00.000Z',
+          content: 'history recovered without user retry',
+        }],
+      })
+
+    useChatStore.getState().connectToSession(sessionId, '-project-timeout')
+    await useChatStore.getState().loadHistory(sessionId, '-project-timeout')
+
+    expect(getMessagesMock).toHaveBeenCalledTimes(2)
+    expect(getMessagesMock).toHaveBeenNthCalledWith(1, sessionId, {
+      limit: 80,
+      projectPath: '-project-timeout',
+    })
+    expect(getMessagesMock).toHaveBeenNthCalledWith(2, sessionId, {
+      limit: 80,
+      projectPath: '-project-timeout',
+    }, {
+      timeout: 30_000,
+      recoverConnection: true,
+    })
+    expect(useChatStore.getState().sessions[sessionId]).toMatchObject({
+      historyLoadState: 'loaded',
+      messages: [{ type: 'user_text', content: 'history recovered without user retry' }],
+    })
+  })
+
+  it('does not retry a non-transient history response error', async () => {
+    const sessionId = 'invalid-history-response-session'
+    const getMessagesMock = vi.mocked(sessionsApi.getMessages)
+    getMessagesMock.mockReset()
+    getMessagesMock.mockRejectedValueOnce(new ApiError(400, {
+      message: 'Invalid history request',
+    }))
+
+    useChatStore.getState().connectToSession(sessionId, '-project-invalid')
+    await useChatStore.getState().loadHistory(sessionId, '-project-invalid')
+
+    expect(getMessagesMock).toHaveBeenCalledOnce()
+    expect(useChatStore.getState().sessions[sessionId]?.historyLoadState).toBe('error')
   })
 
   it('ignores a stale history response after the session project locator changes', async () => {
@@ -3001,5 +3135,90 @@ describe('chatStore loadHistoryUntil', () => {
     const found = await useChatStore.getState().loadHistoryUntil(TEST_SESSION_ID, 'raw-newest')
     expect(found).toBe(true)
     expect(sessionsApi.getMessages).not.toHaveBeenCalled()
+  })
+
+  it('bounds completed history when a new turn starts without touching another session', () => {
+    const longHistory: UIMessage[] = Array.from({ length: 130 }, (_, index) => [
+      {
+        id: `user-${index}`,
+        serverId: `server-user-${index}`,
+        type: 'user_text' as const,
+        content: `question ${index}`,
+        timestamp: index * 2,
+      },
+      {
+        id: `assistant-${index}`,
+        type: 'assistant_text' as const,
+        content: `answer ${index}`,
+        timestamp: index * 2 + 1,
+      },
+    ]).flat()
+    const otherMessages: UIMessage[] = [{
+      id: 'other-user',
+      type: 'user_text',
+      content: 'other session stays intact',
+      timestamp: 1,
+    }]
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSessionState({ messages: longHistory }),
+        'other-session': makeSessionState({ messages: otherMessages }),
+      },
+    })
+
+    useChatStore.getState().sendMessage(TEST_SESSION_ID, 'latest question')
+
+    const current = useChatStore.getState().sessions[TEST_SESSION_ID]!
+    expect(current.messages.length).toBeLessThanOrEqual(WINDOW_SIZE)
+    expect(current.messages[0]?.type).toBe('user_text')
+    expect(current.messages.at(-1)).toMatchObject({
+      type: 'user_text',
+      content: 'latest question',
+    })
+    expect(current.historyBuffer.length).toBeLessThanOrEqual(WINDOW_SIZE)
+    expect(useChatStore.getState().sessions['other-session']?.messages).toEqual(otherMessages)
+  })
+
+  it('keeps the active user turn and tool pairs intact while trimming older turns', () => {
+    const completedTurns: UIMessage[] = Array.from({ length: 130 }, (_, index) => [
+      {
+        id: `old-user-${index}`,
+        serverId: `old-server-user-${index}`,
+        type: 'user_text' as const,
+        content: `old question ${index}`,
+        timestamp: index * 2,
+      },
+      {
+        id: `old-assistant-${index}`,
+        type: 'assistant_text' as const,
+        content: `old answer ${index}`,
+        timestamp: index * 2 + 1,
+      },
+    ]).flat()
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSessionState({
+          messages: [
+            ...completedTurns,
+            { id: 'active-user', type: 'user_text', content: 'active question', timestamp: 300 },
+            { id: 'active-tool', type: 'tool_use', toolUseId: 'active-tool-id', toolName: 'Read', input: {}, timestamp: 301 },
+            { id: 'active-result', type: 'tool_result', toolUseId: 'active-tool-id', content: 'done', isError: false, timestamp: 302 },
+          ],
+          chatState: 'thinking',
+        }),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'thinking',
+      text: 'continue reasoning',
+    })
+
+    const messages = useChatStore.getState().sessions[TEST_SESSION_ID]!.messages
+    expect(messages.length).toBeLessThanOrEqual(WINDOW_SIZE)
+    expect(messages[0]?.type).toBe('user_text')
+    expect(messages.some((message) => message.id === 'active-user')).toBe(true)
+    expect(messages.some((message) => message.id === 'active-tool')).toBe(true)
+    expect(messages.some((message) => message.id === 'active-result')).toBe(true)
   })
 })

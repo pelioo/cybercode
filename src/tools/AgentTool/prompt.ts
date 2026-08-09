@@ -157,7 +157,6 @@ ${AGENT_TOOL_NAME}({
 
 <example_agent_descriptions>
 "test-runner": use this agent after you are done writing code to run tests
-"greeting-responder": use this agent to respond to user greetings with a friendly joke
 </example_agent_descriptions>
 
 <example>
@@ -178,13 +177,7 @@ Since a significant piece of code was written and the task was completed, now us
 assistant: Uses the ${AGENT_TOOL_NAME} tool to launch the test-runner agent
 </example>
 
-<example>
-user: "Hello"
-<commentary>
-Since the user is greeting, use the greeting-responder agent to respond with a friendly joke
-</commentary>
-assistant: "I'm going to use the ${AGENT_TOOL_NAME} tool to launch the greeting-responder agent"
-</example>
+Do not launch an agent for greetings, acknowledgements, or other purely conversational turns.
 `
 
   // When the gate is on, the agent list lives in an agent_listing_delta

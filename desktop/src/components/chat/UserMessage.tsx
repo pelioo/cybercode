@@ -47,8 +47,6 @@ export function UserMessage({
         {(hasText || hasAttachments) && (
           <div
             data-message-row="user"
-            onPointerEnter={showActions}
-            onPointerLeave={scheduleHideActions}
             className="flex w-full items-end justify-end gap-[8px]"
           >
             <div

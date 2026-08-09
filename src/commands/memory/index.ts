@@ -5,7 +5,7 @@ const memory: Command = {
   name: 'memory',
   description: 'Manage CyberCode prompt memory and instruction files',
   argumentHint:
-    'status | edit soul|brief|user | add brief|user <entry> | remove brief|user <text>',
+    'status | edit soul|brief|project|user | add brief|project|user <entry> | remove brief|project|user <text>',
   load: () => import('./memory.js'),
 }
 

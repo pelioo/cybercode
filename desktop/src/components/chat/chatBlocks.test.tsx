@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen } from '@testing-library/react'
 import { ThinkingBlock } from './ThinkingBlock'
 import { ToolCallBlock } from './ToolCallBlock'
@@ -372,7 +372,7 @@ describe('chat blocks', () => {
     expect(activityContainer?.className).toBe(collapsedWidthClasses)
     const activityDetails = container.querySelector('[data-tool-activity-details]')
     expect(activityDetails?.className).toContain('border-t')
-    expect(activityDetails?.className).toContain('max-h-[284px]')
+    expect(activityDetails?.className).toContain('max-h-[64px]')
     expect(activityDetails?.className).toContain('overflow-y-auto')
     expect(activityDetails?.className).toContain('scrollbar-no-track')
     expect(activityButton.className).toContain('text-center')
@@ -430,6 +430,71 @@ describe('chat blocks', () => {
       'Used 2 tools · Read 1 file · Modified 1 file',
     )
     expect(container.querySelector('[data-tool-activity-details]')).toBeTruthy()
+  })
+
+  it('keeps live activity scrolled to the latest command', () => {
+    const frameCallbacks: FrameRequestCallback[] = []
+    const animationFrame = vi
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation((callback) => {
+        frameCallbacks.push(callback)
+        return frameCallbacks.length
+      })
+    const firstCommand = {
+      id: 'live-bash-one',
+      type: 'tool_use' as const,
+      toolName: 'Bash',
+      toolUseId: 'live-bash-one-tool',
+      input: { command: 'bun test first' },
+      timestamp: Date.now(),
+    }
+    const secondCommand = {
+      id: 'live-bash-two',
+      type: 'tool_use' as const,
+      toolName: 'Bash',
+      toolUseId: 'live-bash-two-tool',
+      input: { command: 'bun test second' },
+      timestamp: Date.now(),
+    }
+
+    const { container, rerender } = render(
+      <ToolCallGroup
+        toolCalls={[firstCommand]}
+        resultMap={new Map()}
+        childToolCallsByParent={new Map()}
+        agentTaskNotifications={{}}
+        isStreaming
+      />,
+    )
+    const details = container.querySelector('[data-tool-activity-details]') as HTMLDivElement
+    let scrollHeight = 220
+    Object.defineProperty(details, 'scrollHeight', {
+      configurable: true,
+      get: () => scrollHeight,
+    })
+    Object.defineProperty(details, 'clientHeight', {
+      configurable: true,
+      value: 100,
+    })
+
+    frameCallbacks.shift()?.(0)
+    expect(details.scrollTop).toBe(220)
+
+    scrollHeight = 360
+    rerender(
+      <ToolCallGroup
+        toolCalls={[firstCommand, secondCommand]}
+        resultMap={new Map()}
+        childToolCallsByParent={new Map()}
+        agentTaskNotifications={{}}
+        isStreaming
+      />,
+    )
+
+    expect(frameCallbacks).toHaveLength(1)
+    frameCallbacks.shift()?.(16)
+    expect(details.scrollTop).toBe(360)
+    animationFrame.mockRestore()
   })
 
   it('stays expanded between tool waves until the assistant turn finishes', () => {

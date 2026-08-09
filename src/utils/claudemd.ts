@@ -288,6 +288,8 @@ export type MemoryFileInfo = {
   content: string
   parent?: string // Path of the file that included this one
   globs?: string[] // Glob patterns for file paths this rule applies to
+  sessions?: string[] // CyberCode instruction profiles this file applies to
+  projects?: string[] // Project directory names/paths this file applies to
   // True when auto-injection transformed `content` (stripped HTML comments,
   // stripped frontmatter, truncated MEMORY.md) such that it no longer matches
   // the bytes on disk. When set, `rawContent` holds the unmodified disk bytes
@@ -303,35 +305,104 @@ function pathInOriginalCwd(path: string): boolean {
 }
 
 /**
- * Parses raw content to extract both content and glob patterns from frontmatter
+ * Parses instruction selectors from memory-file frontmatter.
  * @param rawContent Raw file content with frontmatter
- * @returns Object with content and globs (undefined if no paths or match-all pattern)
+ * @returns Content plus optional file, session, and project selectors
  */
-function parseFrontmatterPaths(rawContent: string): {
+function parseInstructionFrontmatter(rawContent: string): {
   content: string
   paths?: string[]
+  sessions?: string[]
+  projects?: string[]
 } {
   const { frontmatter, content } = parseFrontmatter(rawContent)
-
-  if (!frontmatter.paths) {
-    return { content }
-  }
-
-  const patterns = splitPathInFrontmatter(frontmatter.paths)
-    .map(pattern => {
-      // Remove /** suffix - ignore library treats 'path' as matching both
-      // the path itself and everything inside it
-      return pattern.endsWith('/**') ? pattern.slice(0, -3) : pattern
-    })
-    .filter((p: string) => p.length > 0)
+  const patterns = frontmatter.paths
+    ? splitPathInFrontmatter(frontmatter.paths)
+        .map(pattern => {
+          // Remove /** suffix - ignore library treats 'path' as matching both
+          // the path itself and everything inside it
+          return pattern.endsWith('/**') ? pattern.slice(0, -3) : pattern
+        })
+        .filter((p: string) => p.length > 0)
+    : []
+  const sessions = frontmatter.sessions
+    ? splitPathInFrontmatter(frontmatter.sessions)
+        .map(value => value.trim().toLowerCase())
+        .filter(Boolean)
+    : []
+  const projects = frontmatter.projects
+    ? splitPathInFrontmatter(frontmatter.projects)
+        .map(value => value.trim())
+        .filter(Boolean)
+    : []
 
   // If all patterns are ** (match-all), treat as no globs (undefined)
   // This means the file applies to all paths
-  if (patterns.length === 0 || patterns.every((p: string) => p === '**')) {
-    return { content }
-  }
+  const paths =
+    patterns.length === 0 || patterns.every((p: string) => p === '**')
+      ? undefined
+      : patterns
 
-  return { content, paths: patterns }
+  return {
+    content,
+    paths,
+    sessions: sessions.length > 0 ? sessions : undefined,
+    projects: projects.length > 0 ? projects : undefined,
+  }
+}
+
+export function getInstructionSessionProfile(): string {
+  const explicit = process.env.CYBERCODE_INSTRUCTION_PROFILE
+    ?.trim()
+    .toLowerCase()
+  if (explicit) return explicit
+  if (isEnvTruthy(process.env.CLAUDE_CODE_REMOTE)) return 'remote'
+  return 'coding'
+}
+
+function matchesInstructionProject(patterns: string[], cwd: string): boolean {
+  const normalizedCwd = cwd.replaceAll('\\', '/')
+  const projectName = basename(cwd)
+
+  return patterns.some(rawPattern => {
+    const pattern = rawPattern.replaceAll('\\', '/')
+    if (pattern === '*') return true
+    if (pattern.startsWith('~/') || isAbsolute(pattern)) {
+      return picomatch.isMatch(
+        normalizedCwd,
+        expandPath(pattern).replaceAll('\\', '/'),
+        { dot: true },
+      )
+    }
+    return (
+      picomatch.isMatch(projectName, pattern, { dot: true }) ||
+      picomatch.isMatch(normalizedCwd, pattern, { dot: true })
+    )
+  })
+}
+
+export function instructionMemoryAppliesToCurrentContext(
+  file: Pick<MemoryFileInfo, 'sessions' | 'projects'>,
+  context: {
+    profile?: string
+    projectPath?: string
+  } = {},
+): boolean {
+  const profile = context.profile ?? getInstructionSessionProfile()
+  if (
+    file.sessions &&
+    !file.sessions.includes('*') &&
+    !file.sessions.includes(profile)
+  ) {
+    return false
+  }
+  return (
+    !file.projects ||
+    matchesInstructionProject(
+      file.projects,
+      context.projectPath ?? getOriginalCwd(),
+    )
+  )
 }
 
 /**
@@ -409,8 +480,8 @@ function parseMemoryFileContent(
     return { info: null, includePaths: [] }
   }
 
-  const { content: withoutFrontmatter, paths } =
-    parseFrontmatterPaths(rawContent)
+  const { content: withoutFrontmatter, paths, sessions, projects } =
+    parseInstructionFrontmatter(rawContent)
 
   // Lex once so strip and @include-extract share the same tokens. gfm:false
   // is required by extract (so ~/path doesn't tokenize as strikethrough) and
@@ -448,6 +519,8 @@ function parseMemoryFileContent(
       type,
       content: finalContent,
       globs: paths,
+      sessions,
+      projects,
       contentDiffersFromDisk,
       rawContent: contentDiffersFromDisk ? rawContent : undefined,
     },
@@ -729,6 +802,9 @@ export async function processMemoryFile(
   const { info: memoryFile, includePaths: resolvedIncludePaths } =
     await safelyReadMemoryFileAsync(filePath, type, resolvedPath)
   if (!memoryFile || !memoryFile.content.trim()) {
+    return []
+  }
+  if (!instructionMemoryAppliesToCurrentContext(memoryFile)) {
     return []
   }
 

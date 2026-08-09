@@ -12,14 +12,17 @@ import { setTimeout as delay } from 'timers/promises'
 import { getErrnoCode, isFsInaccessible } from '../utils/errors.js'
 import {
   BRIEF_CHAR_LIMIT,
+  PROJECT_EXPERIENCE_CHAR_LIMIT,
   SOUL_CHAR_LIMIT,
   USER_PROMPT_MEMORY_CHAR_LIMIT,
 } from './budget.js'
 import {
   BRIEF_FILENAME,
+  PROJECT_EXPERIENCE_FILENAME,
   SOUL_FILENAME,
   USER_PROMPT_MEMORY_FILENAME,
   getBriefPath,
+  getProjectExperiencePath,
   getSoulPath,
   getUserPromptMemoryPath,
 } from './paths.js'
@@ -32,7 +35,7 @@ const LOCK_STALE_MS = 30_000
 const LOCK_RETRY_COUNT = 50
 const LOCK_RETRY_DELAY_MS = 20
 
-export type PromptMemoryTarget = 'soul' | 'brief' | 'user'
+export type PromptMemoryTarget = 'soul' | 'brief' | 'project' | 'user'
 export type PromptMemoryEntryTarget = Exclude<PromptMemoryTarget, 'soul'>
 export type PromptMemoryAction = 'add' | 'replace' | 'remove'
 export type PromptMemoryFormat = 'empty' | 'plain' | 'entries'
@@ -101,6 +104,13 @@ function getTargetConfig(target: PromptMemoryTarget): TargetConfig {
         path: getBriefPath(),
         limit: BRIEF_CHAR_LIMIT,
       }
+    case 'project':
+      return {
+        target,
+        filename: PROJECT_EXPERIENCE_FILENAME,
+        path: getProjectExperiencePath(),
+        limit: PROJECT_EXPERIENCE_CHAR_LIMIT,
+      }
     case 'user':
       return {
         target,
@@ -114,7 +124,14 @@ function getTargetConfig(target: PromptMemoryTarget): TargetConfig {
 export function parsePromptMemoryTarget(
   value: string | undefined,
 ): PromptMemoryTarget | null {
-  if (value === 'soul' || value === 'brief' || value === 'user') return value
+  if (
+    value === 'soul' ||
+    value === 'brief' ||
+    value === 'project' ||
+    value === 'user'
+  ) {
+    return value
+  }
   return null
 }
 
@@ -297,12 +314,13 @@ export async function readPromptMemoryFile(
 }
 
 export async function getPromptMemoryStatus(): Promise<PromptMemoryStatus> {
-  const [soul, brief, user] = await Promise.all([
+  const [soul, brief, project, user] = await Promise.all([
     readPromptMemoryFile('soul'),
     readPromptMemoryFile('brief'),
+    readPromptMemoryFile('project'),
     readPromptMemoryFile('user'),
   ])
-  return { files: { soul, brief, user } }
+  return { files: { soul, brief, project, user } }
 }
 
 export async function writePromptMemoryFile(

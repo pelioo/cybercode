@@ -46,6 +46,11 @@ import { sanitizeErrorMessage } from './webSession/vendor/omniroute/open-sse/uti
 import { prepareAnthropicRequestForProvider } from './localModelPerformance.js'
 import { executeRouteGraph } from './routeGraphExecutor.js'
 import { isLocalInferenceProvider, resolveOllamaKeepAlive } from '../../utils/localModelPerformance.js'
+import {
+  buildOpenAIPromptCacheKey,
+  resolvePromptCacheSessionId,
+  supportsOpenAIPromptCacheKey,
+} from './promptCache.js'
 
 const providerService = new ProviderService()
 
@@ -127,6 +132,8 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
     const sessionId = decodeURIComponent(routeMatch[2]!)
     return handleRoutedRequest(req, routeId, sessionId, body)
   }
+
+  const promptCacheSessionId = resolvePromptCacheSessionId(req)
 
   // Read active/default provider config or an explicitly-scoped provider config.
   const config = await providerService.getProviderForProxy(providerId)
@@ -231,6 +238,7 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
         runtimeAuth ?? undefined,
         preparedRequest.localModelPerformance,
         resolveOllamaKeepAlive(config),
+        promptCacheSessionId,
       )
     } else {
       return await handleOpenaiResponses(
@@ -242,6 +250,7 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
         runtimeHeaders,
         config.oauthProviderId,
         preparedRequest.localModelPerformance,
+        promptCacheSessionId,
       )
     }
   } catch (err) {
@@ -301,7 +310,7 @@ async function handleRoutedRequest(
       plan: plan.graphPlan,
       signal: req.signal,
       forward: (target, routedBody, signal) => (
-        forwardToTarget(req, target, routedBody, signal)
+        forwardToTarget(req, target, routedBody, signal, sessionId)
       ),
       prime: (response, stream) => (
         stream ? primeStreamingResponse(response) : primeNonStreamingResponse(response)
@@ -321,7 +330,13 @@ async function handleRoutedRequest(
     const routedBody = { ...body, model: target.modelId }
 
     try {
-      const response = await forwardToTarget(req, target, routedBody)
+      const response = await forwardToTarget(
+        req,
+        target,
+        routedBody,
+        req.signal,
+        sessionId,
+      )
       if (req.signal.aborted) {
         await response.body?.cancel().catch(() => {})
         return clientCancelledResponse()
@@ -427,6 +442,7 @@ async function forwardToTarget(
   target: ResolvedRouteTarget,
   body: AnthropicRequest,
   signal: AbortSignal = req.signal,
+  promptCacheSessionId?: string,
 ): Promise<Response> {
   const provider = target.provider
   if (isWebSessionProvider(provider)) {
@@ -484,6 +500,7 @@ async function forwardToTarget(
       runtimeAuth ?? undefined,
       preparedRequest.localModelPerformance,
       resolveOllamaKeepAlive(provider),
+      promptCacheSessionId,
     )
   }
   return handleOpenaiResponses(
@@ -495,6 +512,7 @@ async function forwardToTarget(
     runtimeAuth?.headers,
     provider.oauthProviderId,
     preparedRequest.localModelPerformance,
+    promptCacheSessionId,
   )
 }
 
@@ -789,11 +807,20 @@ async function handleOpenaiChat(
   runtimeAuth?: ProviderRuntimeAuth,
   localModelPerformance = false,
   ollamaKeepAlive?: string,
+  promptCacheSessionId?: string,
 ): Promise<Response> {
   const isKimi = isKimiBaseUrl(baseUrl)
+  const supportsPromptCaching = supportsOpenAIPromptCacheKey(
+    baseUrl,
+    oauthProviderId,
+  )
   const transformed = anthropicToOpenaiChat(body, {
     kimiThinking: isKimi,
     preserveReasoningContent: isKimi,
+    promptCacheKey: supportsPromptCaching
+      ? buildOpenAIPromptCacheKey(promptCacheSessionId)
+      : undefined,
+    includeStreamUsage: supportsPromptCaching,
   }) as OpenAIChatRequest & { keep_alive?: string }
   // Ollama unloads models ~5min after the last request; keep_alive pins the
   // warmed model. Ollama tolerates the unknown field on /v1/chat/completions.
@@ -1003,8 +1030,12 @@ async function handleOpenaiResponses(
   extraHeaders?: Record<string, string>,
   oauthProviderId?: string,
   localModelPerformance = false,
+  promptCacheSessionId?: string,
 ): Promise<Response> {
-  const baseRequest = anthropicToOpenaiResponses(body)
+  const promptCacheKey = supportsOpenAIPromptCacheKey(baseUrl, oauthProviderId)
+    ? buildOpenAIPromptCacheKey(promptCacheSessionId)
+    : undefined
+  const baseRequest = anthropicToOpenaiResponses(body, { promptCacheKey })
   const isCodex = oauthProviderId === 'codex'
   const isGrokBuild = oauthProviderId === 'grok-cli'
   const transformed = isCodex

@@ -25,8 +25,13 @@ function isProactiveActive_SAFE_TO_CALL_ANYWHERE(): boolean {
   return proactiveModule?.isProactiveActive() ?? false
 }
 
-const PROMPT_MEMORY_MARKERS = ['# CyberCode Soul', '# Prompt Memory']
+const PROMPT_MEMORY_MARKERS = [
+  '# CyberCode Soul',
+  '# Evolution Memory',
+  '# Prompt Memory',
+]
 const GLOBAL_OPTIMIZATION_MARKERS = [
+  '# Active Policy Overrides',
   '# Caveman response compression',
   '# Ponytail minimal implementation discipline',
   '# Lazy Programmer minimal implementation discipline',

@@ -156,6 +156,10 @@ vi.mock('../components/chat/CodeViewer', () => ({
   CodeViewer: ({ code }: { code: string }) => <pre data-testid="code-viewer">{code}</pre>,
 }))
 
+vi.mock('../components/controls/ModelSelector', () => ({
+  ModelSelector: () => <button type="button">Opus 4.8</button>,
+}))
+
 describe('Settings > General tab', () => {
   beforeEach(() => {
     MOCK_DELETE_PROVIDER.mockReset()
@@ -292,6 +296,10 @@ describe('Settings > Providers tab', () => {
       'Model sharing',
       'Runtime status',
     ])
+    expect(within(sidebar).getByText('Default for new sessions')).toBeInTheDocument()
+    expect(within(sidebar).getByText(
+      'No fixed choice. New sessions follow the current provider and model.',
+    )).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Models & Routing' })).not.toBeInTheDocument()
   }, 15_000)
 

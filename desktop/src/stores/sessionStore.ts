@@ -1,7 +1,10 @@
 import { create } from 'zustand'
 import { sessionsApi } from '../api/sessions'
 import { t } from '../i18n'
-import { useSessionRuntimeStore } from './sessionRuntimeStore'
+import {
+  NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY,
+  useSessionRuntimeStore,
+} from './sessionRuntimeStore'
 import type { CreateSessionInput, SessionListItem } from '../types/session'
 import { getDefaultSessionTitle } from '../utils/sessionTitle'
 
@@ -188,6 +191,13 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     }))
     if (!isTemporary) {
       writeHiddenProjectPaths(get().hiddenProjectPaths)
+    }
+
+    const runtimeStore = useSessionRuntimeStore.getState()
+    const defaultRuntimeSelection =
+      runtimeStore.selections[NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY]
+    if (defaultRuntimeSelection) {
+      runtimeStore.setSelection(id, defaultRuntimeSelection)
     }
 
     void get().fetchSessions()

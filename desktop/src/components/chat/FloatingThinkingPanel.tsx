@@ -9,6 +9,7 @@ import {
 
 import { useTranslation } from '../../i18n'
 import { Icon } from '../shared/Icon'
+import { CHAT_ACTIVITY_BODY_MAX_HEIGHT_CLASS } from './activityPanelLayout'
 
 type FloatingThinkingPanelProps = {
   content?: string
@@ -211,7 +212,7 @@ export function FloatingThinkingPanel({
         {expanded && (
           <div
             ref={bodyRef}
-            className="scrollbar-no-track max-h-[142px] overflow-y-auto border-t border-[var(--color-border-separator)]/45 px-[16px] py-[12px]"
+            className={`scrollbar-no-track ${CHAT_ACTIVITY_BODY_MAX_HEIGHT_CLASS} overflow-y-auto border-t border-[var(--color-border-separator)]/45 px-[16px] py-[12px]`}
             style={{ animation: 'fade-in 200ms cubic-bezier(0.16, 1, 0.3, 1)' }}
             onScroll={handleScroll}
             onWheelCapture={(event) => {

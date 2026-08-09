@@ -17,16 +17,18 @@ import { PROMPT_MEMORY_TOOL_NAME } from './constants.js'
 import { DESCRIPTION, PROMPT } from './prompt.js'
 
 const actionSchema = z.enum(['status', 'read', 'add', 'replace', 'remove', 'write'])
-const targetSchema = z.enum(['soul', 'brief', 'user'])
+const targetSchema = z.enum(['soul', 'brief', 'project', 'user'])
 
 const inputSchema = lazySchema(() =>
   z.strictObject({
     action: actionSchema.describe(
-      'Operation to perform. Use add/replace/remove for BRIEF.md and USER.md entries. Use write for explicit full-file writes.',
+      'Operation to perform. Use add/replace/remove for global, project, and user entries. Use write for explicit full-file writes.',
     ),
     target: targetSchema
       .optional()
-      .describe('Target file: soul, brief, or user. Required except for status.'),
+      .describe(
+        'Target file: soul, brief (global methods), project, or user. Required except for status.',
+      ),
     content: z
       .string()
       .optional()
@@ -76,7 +78,11 @@ const NATURAL_ACK_GUIDANCE =
 
 function requireTarget(input: Input): PromptMemoryTarget {
   const target = parsePromptMemoryTarget(input.target)
-  if (!target) throw new Error('target is required and must be soul, brief, or user')
+  if (!target) {
+    throw new Error(
+      'target is required and must be soul, brief, project, or user',
+    )
+  }
   return target
 }
 
@@ -97,7 +103,9 @@ function assertEntryActionTarget(
   target: PromptMemoryTarget,
 ): asserts target is Exclude<PromptMemoryTarget, 'soul'> {
   if (target === 'soul') {
-    throw new Error(`${action} is only supported for brief or user memory`)
+    throw new Error(
+      `${action} is only supported for brief, project, or user memory`,
+    )
   }
 }
 
@@ -106,7 +114,7 @@ export const PromptMemoryTool = buildTool({
   searchHint: 'save persistent user and agent memory',
   maxResultSizeChars: 20_000,
   strict: true,
-  alwaysLoad: true,
+  alwaysLoad: false,
   async description() {
     return DESCRIPTION
   },

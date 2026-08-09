@@ -44,10 +44,7 @@ import { FILE_WRITE_TOOL_NAME } from '../../tools/FileWriteTool/prompt.js'
 import { NOTEBOOK_EDIT_TOOL_NAME } from '../../tools/NotebookEditTool/constants.js'
 import { POWERSHELL_TOOL_NAME } from '../../tools/PowerShellTool/toolName.js'
 import { parseGitCommitId } from '../../tools/shared/gitOperationTracking.js'
-import {
-  isDeferredTool,
-  TOOL_SEARCH_TOOL_NAME,
-} from '../../tools/ToolSearchTool/prompt.js'
+import { TOOL_SEARCH_TOOL_NAME } from '../../tools/ToolSearchTool/prompt.js'
 import { getAllBaseTools } from '../../tools.js'
 import type { HookProgress } from '../../types/hooks.js'
 import type {
@@ -108,6 +105,8 @@ import {
 } from '../../utils/toolResultStorage.js'
 import {
   extractDiscoveredToolNames,
+  getToolSearchTransport,
+  isToolDeferredForProtocol,
   isToolSearchEnabledOptimistic,
   isToolSearchToolAvailable,
 } from '../../utils/toolSearch.js'
@@ -579,6 +578,7 @@ export function buildSchemaNotSentHint(
   tool: Tool,
   messages: Message[],
   tools: readonly { name: string }[],
+  model = '',
 ): string | null {
   // Optimistic gating — reconstructing claude.ts's full useToolSearch
   // computation is fragile. These two gates prevent pointing at a ToolSearch
@@ -586,7 +586,9 @@ export function buildSchemaNotSentHint(
   // cost one extra round-trip on an already-failing path.
   if (!isToolSearchEnabledOptimistic()) return null
   if (!isToolSearchToolAvailable(tools)) return null
-  if (!isDeferredTool(tool)) return null
+  if (!isToolDeferredForProtocol(tool, getToolSearchTransport(model))) {
+    return null
+  }
   const discovered = extractDiscoveredToolNames(messages)
   if (discovered.has(tool.name)) return null
   return (
@@ -620,6 +622,7 @@ async function checkPermissionsAndCallTool(
       tool,
       toolUseContext.messages,
       toolUseContext.options.tools,
+      toolUseContext.options.mainLoopModel,
     )
     if (schemaHint) {
       logEvent('tengu_deferred_tool_schema_not_sent', {

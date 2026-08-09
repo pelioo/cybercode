@@ -146,4 +146,119 @@ describe('SessionService.getSessionUserAnchors', () => {
       service.getSessionUserAnchors('00000000-0000-0000-0000-000000000000'),
     ).rejects.toThrow('Session not found')
   })
+
+  it('invalidates a cached transcript after a same-size rewrite', async () => {
+    const sessionId = '11111111-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const projectDir = '-same-size-project'
+    const userId = 'same-size-user'
+    await writeSessionFile(projectDir, sessionId, [makeUserEntry('first question', userId)])
+
+    expect((await service.getSessionUserAnchors(sessionId))[0]?.preview).toBe('first question')
+
+    await writeSessionFile(projectDir, sessionId, [makeUserEntry('other question', userId)])
+    const filePath = path.join(tmpDir, 'projects', projectDir, `${sessionId}.jsonl`)
+    const changedAt = new Date(Date.now() + 1000)
+    await fs.utimes(filePath, changedAt, changedAt)
+
+    expect((await service.getSessionUserAnchors(sessionId))[0]?.preview).toBe('other question')
+  })
+
+  it('does not splice cached entries into a larger full-file replacement', async () => {
+    const sessionId = '22222222-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const projectDir = '-replacement-project'
+    await writeSessionFile(projectDir, sessionId, [makeUserEntry('old question', 'old-user')])
+    expect((await service.getSessionUserAnchors(sessionId)).map((anchor) => anchor.preview)).toEqual([
+      'old question',
+    ])
+
+    await writeSessionFile(projectDir, sessionId, [
+      makeUserEntry('new first question', 'new-user-1'),
+      makeAssistantEntry('new first answer'),
+      makeUserEntry('new second question', 'new-user-2'),
+    ])
+    const filePath = path.join(tmpDir, 'projects', projectDir, `${sessionId}.jsonl`)
+    const changedAt = new Date(Date.now() + 1000)
+    await fs.utimes(filePath, changedAt, changedAt)
+
+    expect((await service.getSessionUserAnchors(sessionId)).map((anchor) => anchor.preview)).toEqual([
+      'new first question',
+      'new second question',
+    ])
+  })
+
+  it('deduplicates concurrent transcript snapshot reads', async () => {
+    const sessionId = '33333333-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-snapshot-project', sessionId, [
+      makeUserEntry('shared snapshot', 'snapshot-user'),
+      makeAssistantEntry('shared answer'),
+    ])
+    const serviceInternals = service as unknown as {
+      readJsonlFile: (filePath: string, maxBytes?: number) => Promise<unknown[]>
+    }
+    const originalRead = serviceInternals.readJsonlFile.bind(service)
+    let readCount = 0
+    serviceInternals.readJsonlFile = async (filePath: string, maxBytes?: number) => {
+      readCount += 1
+      return originalRead(filePath, maxBytes)
+    }
+
+    await Promise.all([
+      service.getSessionUserAnchors(sessionId),
+      service.getTranscriptMetadata(sessionId),
+      service.getSessionWorkDir(sessionId),
+    ])
+
+    expect(readCount).toBe(1)
+  })
+
+  it('does not cache bytes appended after a snapshot read starts', async () => {
+    const sessionId = '55555555-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const projectDir = '-growing-snapshot-project'
+    const filePath = path.join(tmpDir, 'projects', projectDir, `${sessionId}.jsonl`)
+    await writeSessionFile(projectDir, sessionId, [
+      makeUserEntry('first question', 'growing-user-1'),
+    ])
+
+    const serviceInternals = service as unknown as {
+      readJsonlFile: (filePath: string, maxBytes?: number) => Promise<unknown[]>
+    }
+    const originalRead = serviceInternals.readJsonlFile.bind(service)
+    let appended = false
+    serviceInternals.readJsonlFile = async (targetPath: string, maxBytes?: number) => {
+      if (!appended) {
+        appended = true
+        await fs.appendFile(
+          filePath,
+          `${JSON.stringify(makeUserEntry('second question', 'growing-user-2'))}\n`,
+          'utf-8',
+        )
+      }
+      return originalRead(targetPath, maxBytes)
+    }
+
+    expect((await service.getSessionUserAnchors(sessionId)).map((anchor) => anchor.preview)).toEqual([
+      'first question',
+    ])
+    expect((await service.getSessionUserAnchors(sessionId)).map((anchor) => anchor.preview)).toEqual([
+      'first question',
+      'second question',
+    ])
+  })
+
+  it('invalidates the anchor snapshot after trimming the transcript', async () => {
+    const sessionId = '44444444-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-trim-project', sessionId, [
+      makeUserEntry('keep question', 'keep-user'),
+      makeAssistantEntry('keep answer'),
+      makeUserEntry('remove question', 'remove-user'),
+      makeAssistantEntry('remove answer'),
+    ])
+    expect(await service.getSessionUserAnchors(sessionId)).toHaveLength(2)
+
+    await service.trimSessionMessagesFrom(sessionId, 'remove-user')
+
+    expect((await service.getSessionUserAnchors(sessionId)).map((anchor) => anchor.messageId)).toEqual([
+      'keep-user',
+    ])
+  })
 })

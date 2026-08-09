@@ -4,6 +4,7 @@ import type { RuntimeSelection } from '../types/runtime'
 const STORAGE_KEY = 'cybercode-session-runtime'
 
 export const DRAFT_RUNTIME_SELECTION_KEY = '__draft__'
+export const NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY = '__new_session_default__'
 
 type SessionRuntimeStore = {
   selections: Record<string, RuntimeSelection>

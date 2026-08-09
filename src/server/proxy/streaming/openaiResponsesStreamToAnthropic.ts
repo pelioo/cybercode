@@ -4,6 +4,8 @@
  * Original work by Jason Young, MIT License
  */
 
+import { mapOpenAIUsage } from '../transform/openaiUsage.js'
+
 type StreamState = {
   nextContentIndex: number
   indexByKey: Map<string, number>        // content part key → Anthropic index
@@ -255,7 +257,9 @@ function processEvent(
     case 'response.completed': {
       const response = data.response as Record<string, unknown> | undefined
       const status = (response?.status as string) || 'completed'
-      const usage = response?.usage as Record<string, number> | undefined
+      const usage = response?.usage && typeof response.usage === 'object'
+        ? response.usage as Record<string, unknown>
+        : undefined
       const hasToolUse = state.toolIndexByItemId.size > 0
 
       const stopReason = status === 'completed'
@@ -265,7 +269,7 @@ function processEvent(
       controller.enqueue(encoder.encode(formatSse('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: usage?.output_tokens ?? 0 },
+        usage: mapOpenAIUsage(usage),
       })))
       if (!state.messageStopped) {
         state.messageStopped = true

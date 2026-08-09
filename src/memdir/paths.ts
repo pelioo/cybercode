@@ -57,10 +57,8 @@ export function isAutoMemoryEnabled(): boolean {
 /**
  * Whether the extract-memories background agent will run this session.
  *
- * The main agent's prompt always has full save instructions regardless of
- * this gate — when the main agent writes memories, the background agent
- * skips that range (hasMemoryWritesSince in extractMemories.ts); when it
- * doesn't, the background agent catches anything missed.
+ * Save instructions are isolated to the turn-end extraction worker. The main
+ * conversation receives only a compact read-only memory contract.
  *
  * Callers must also gate on feature('EXTRACT_MEMORIES') — that check cannot
  * live inside this helper because feature() only tree-shakes when used

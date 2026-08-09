@@ -34,6 +34,7 @@ describe('FloatingThinkingPanel', () => {
     expect(statusIcon).toHaveClass('h-4', 'w-4')
     expect(statusIcon?.querySelector('[data-thinking-status-dot]')).toHaveClass('h-2', 'w-2')
     expect(screen.getByTestId('thinking-message-panel-body').className).toContain('border-t')
+    expect(screen.getByTestId('thinking-message-panel-body').className).toContain('max-h-[64px]')
     expect(screen.getByTestId('thinking-message-panel-title')).not.toHaveClass('ai-shimmer-text')
     expect(screen.getByText('Thinking')).toHaveClass('ai-thinking-sweep-label')
     expect(screen.getByText('Thinking')).toHaveAttribute('data-label', 'Thinking')

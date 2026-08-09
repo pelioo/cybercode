@@ -19,6 +19,8 @@ const CATEGORY_KEYS: Record<PromptMemoryInsightCategory, TranslationKey> = {
   quality: 'settings.memory.insight.category.quality',
   boundaries: 'settings.memory.insight.category.boundaries',
   expertise: 'settings.memory.insight.category.expertise',
+  'project-method': 'settings.memory.insight.category.projectMethod',
+  decision: 'settings.memory.insight.category.decision',
   'meta-method': 'settings.memory.insight.category.metaMethod',
   environment: 'settings.memory.insight.category.environment',
   lesson: 'settings.memory.insight.category.lesson',
@@ -42,11 +44,14 @@ const USER_CATEGORIES: PromptMemoryInsightCategory[] = [
   'other',
 ]
 
-const METHOD_CATEGORIES: PromptMemoryInsightCategory[] = [
-  'meta-method',
+const PROJECT_CATEGORIES: PromptMemoryInsightCategory[] = [
+  'project-method',
+  'decision',
   'environment',
   'lesson',
 ]
+
+const GLOBAL_CATEGORIES: PromptMemoryInsightCategory[] = ['meta-method']
 
 type EntryEditor = {
   mode: 'add' | 'edit'
@@ -89,7 +94,16 @@ function InsightRow({
       className="group grid min-w-0 grid-cols-[32px_minmax(0,1fr)_auto] gap-[11px] border-t border-[var(--color-border-separator)] px-[16px] py-[14px] first:border-t-0 hover:bg-[var(--color-surface-hover)]"
     >
       <span className="flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border border-[var(--color-border-separator)] bg-[var(--color-surface-container-lowest)] text-[var(--color-text-secondary)]">
-        <Icon name={insight.target === 'user' ? 'person' : 'psychology'} size={14} />
+        <Icon
+          name={
+            insight.target === 'user'
+              ? 'person'
+              : insight.target === 'project'
+                ? 'folder'
+                : 'psychology'
+          }
+          size={14}
+        />
       </span>
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-x-[7px] gap-y-[3px] text-[10px] leading-[15px]">
@@ -141,7 +155,7 @@ function InsightGroup({
   onAdd,
 }: {
   title: string
-  icon: 'person' | 'psychology'
+  icon: 'person' | 'folder' | 'psychology'
   insights: PromptMemoryInsight[]
   emptyText: string
   removingId: string | null
@@ -208,7 +222,9 @@ function MemoryEntryEditor({
   const t = useTranslation()
   const baseCategories = editor.target === 'user'
     ? USER_CATEGORIES
-    : METHOD_CATEGORIES
+    : editor.target === 'project'
+      ? PROJECT_CATEGORIES
+      : GLOBAL_CATEGORIES
   const categories = baseCategories.includes(editor.category)
     ? baseCategories
     : [editor.category, ...baseCategories]
@@ -311,19 +327,22 @@ export function EvolutionProfile({
   const [isSaving, setIsSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const userInsights = overview?.insights.filter(insight => insight.target === 'user') ?? []
-  const methodInsights = overview?.insights.filter(insight => insight.target === 'brief') ?? []
+  const projectInsights = overview?.insights.filter(insight => insight.target === 'project') ?? []
+  const globalInsights = overview?.insights.filter(insight => insight.target === 'brief') ?? []
   const stats = overview?.stats ?? {
     total: 0,
     user: 0,
+    project: 0,
+    globalMethods: 0,
     methods: 0,
     dimensions: 0,
     automaticUpdates: 0,
   }
   const summary = [
     ['settings.memory.insight.stat.total', stats.total],
-    ['settings.memory.insight.stat.dimensions', stats.dimensions],
     ['settings.memory.insight.stat.user', stats.user],
-    ['settings.memory.insight.stat.methods', stats.methods],
+    ['settings.memory.insight.stat.project', stats.project],
+    ['settings.memory.insight.stat.global', stats.globalMethods],
   ] as const
 
   const openAddEditor = (target: PromptMemoryInsight['target']) => {
@@ -331,7 +350,12 @@ export function EvolutionProfile({
     setEditor({
       mode: 'add',
       target,
-      category: target === 'user' ? 'collaboration' : 'meta-method',
+      category:
+        target === 'user'
+          ? 'collaboration'
+          : target === 'project'
+            ? 'project-method'
+            : 'meta-method',
       content: '',
     })
   }
@@ -407,9 +431,19 @@ export function EvolutionProfile({
           onAdd={() => openAddEditor('user')}
         />
         <InsightGroup
+          title={t('settings.memory.insight.projectTitle')}
+          icon="folder"
+          insights={projectInsights}
+          emptyText={t('settings.memory.insight.projectEmpty')}
+          removingId={removingId}
+          onEdit={openEditEditor}
+          onRemove={onRemove}
+          onAdd={() => openAddEditor('project')}
+        />
+        <InsightGroup
           title={t('settings.memory.insight.methodTitle')}
           icon="psychology"
-          insights={methodInsights}
+          insights={globalInsights}
           emptyText={t('settings.memory.insight.methodEmpty')}
           removingId={removingId}
           onEdit={openEditEditor}

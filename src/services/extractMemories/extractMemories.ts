@@ -5,8 +5,8 @@
  * It runs once at the end of each complete query loop (when the model produces
  * a final response with no tool calls) via handleStopHooks in stopHooks.ts.
  *
- * Uses the forked agent pattern (runForkedAgent) — a perfect fork of the main
- * conversation that shares the parent's prompt cache.
+ * Uses the forked agent pattern (runForkedAgent) after the user's response has
+ * completed, keeping persistence work out of the main agent's task.
  *
  * State is closure-scoped inside initExtractMemories() rather than module-level,
  * following the same pattern as confidenceRating.ts. Tests call
@@ -15,7 +15,7 @@
 
 import { feature } from 'bun:bundle'
 import { basename } from 'path'
-import { getIsRemoteMode } from '../../bootstrap/state.js'
+import { getIsRemoteMode, getKairosActive } from '../../bootstrap/state.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import { ENTRYPOINT_NAME } from '../../memdir/memdir.js'
 import {
@@ -24,6 +24,7 @@ import {
 } from '../../memdir/memoryScan.js'
 import {
   getAutoMemPath,
+  getAutoMemDailyLogPath,
   isAutoMemoryEnabled,
   isAutoMemPath,
 } from '../../memdir/paths.js'
@@ -57,6 +58,7 @@ import { getFeatureValue_CACHED_MAY_BE_STALE } from '../analytics/growthbook.js'
 import { logEvent } from '../analytics/index.js'
 import { sanitizeToolNameForAnalytics } from '../analytics/metadata.js'
 import {
+  buildExtractAssistantDailyLogPrompt,
   buildExtractAutoOnlyPrompt,
   buildExtractCombinedPrompt,
 } from './prompts.js'
@@ -113,10 +115,8 @@ function countModelVisibleMessagesSince(
  * Returns true if any assistant message after the cursor UUID contains a
  * Write/Edit tool_use block targeting an auto-memory path.
  *
- * The main agent's prompt has full save instructions — when it writes
- * memories, the forked extraction is redundant. runExtraction skips the
- * agent and advances the cursor past this range, making the main agent
- * and the background agent mutually exclusive per turn.
+ * Explicit memory-management commands may still write directly. In that case
+ * the forked extraction is redundant, so the worker skips the same range.
  */
 function hasMemoryWritesSince(
   messages: Message[],
@@ -400,7 +400,13 @@ export function initExtractMemories(): void {
       )
 
       const userPrompt =
-        feature('TEAMMEM') && teamMemoryEnabled
+        feature('KAIROS') && getKairosActive()
+          ? buildExtractAssistantDailyLogPrompt(
+              newMessageCount,
+              existingMemories,
+              getAutoMemDailyLogPath(),
+            )
+          : feature('TEAMMEM') && teamMemoryEnabled
           ? buildExtractCombinedPrompt(
               newMessageCount,
               existingMemories,

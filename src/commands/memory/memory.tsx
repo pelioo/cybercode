@@ -36,13 +36,15 @@ function getTargetLabel(target: PromptMemoryTarget): string {
       return 'SOUL.md'
     case 'brief':
       return 'BRIEF.md'
+    case 'project':
+      return 'PROJECT_EXPERIENCE.md'
     case 'user':
       return 'USER.md'
   }
 }
 
 function formatStatusLine(target: PromptMemoryTarget): string {
-  return getTargetLabel(target).padEnd(8)
+  return getTargetLabel(target).padEnd(22)
 }
 
 async function ensureEditablePromptMemoryFile(
@@ -97,7 +99,7 @@ async function ensureInstructionMemoryFile(memoryPath: string): Promise<void> {
 
 async function formatPromptMemoryStatus(): Promise<string> {
   const status = await getPromptMemoryStatus()
-  const lines = (['soul', 'brief', 'user'] as const).map(target => {
+  const lines = (['soul', 'user', 'project', 'brief'] as const).map(target => {
     const file = status.files[target]
     const entries =
       target === 'soul'
@@ -159,19 +161,19 @@ async function runPromptMemoryArgs(args: string): Promise<string | null> {
   }
 
   if (command === 'edit' || command === 'open') {
-    if (!target) return 'Usage: /memory edit soul|brief|user'
+    if (!target) return 'Usage: /memory edit soul|brief|project|user'
     return openPromptMemoryFile(target)
   }
 
   if (command === 'write') {
-    if (!target) return 'Usage: /memory write soul|brief|user <content>'
+    if (!target) return 'Usage: /memory write soul|brief|project|user <content>'
     const file = await writePromptMemoryFile(target, rest)
     return `Wrote ${getTargetLabel(target)} (${file.charCount}/${file.limit} chars). Changes apply to future conversations.`
   }
 
   if (command === 'add') {
     if (!target || target === 'soul') {
-      return 'Usage: /memory add brief|user <entry>'
+      return 'Usage: /memory add brief|project|user <entry>'
     }
     const result = await addPromptMemoryEntry(target, rest)
     return `${result.message} ${getTargetLabel(target)} now has ${result.entryCount} entries.`
@@ -179,7 +181,7 @@ async function runPromptMemoryArgs(args: string): Promise<string | null> {
 
   if (command === 'remove' || command === 'forget') {
     if (!target || target === 'soul') {
-      return 'Usage: /memory remove brief|user <text to match>'
+      return 'Usage: /memory remove brief|project|user <text to match>'
     }
     const result = await removePromptMemoryEntry(target, rest)
     return `${result.message} ${getTargetLabel(target)} now has ${result.entryCount} entries.`
@@ -187,11 +189,11 @@ async function runPromptMemoryArgs(args: string): Promise<string | null> {
 
   if (command === 'replace') {
     if (!target || target === 'soul') {
-      return 'Usage: /memory replace brief|user <old text> => <new entry>'
+      return 'Usage: /memory replace brief|project|user <old text> => <new entry>'
     }
     const parsed = parseReplaceArgs(rest)
     if (!parsed) {
-      return 'Usage: /memory replace brief|user <old text> => <new entry>'
+      return 'Usage: /memory replace brief|project|user <old text> => <new entry>'
     }
     const result = await replacePromptMemoryEntry(
       target,
@@ -205,11 +207,11 @@ async function runPromptMemoryArgs(args: string): Promise<string | null> {
     'Usage:',
     '/memory status',
     '/memory log',
-    '/memory edit soul|brief|user',
-    '/memory add brief|user <entry>',
-    '/memory remove brief|user <text to match>',
-    '/memory replace brief|user <old text> => <new entry>',
-    '/memory write soul|brief|user <content>',
+    '/memory edit soul|brief|project|user',
+    '/memory add brief|project|user <entry>',
+    '/memory remove brief|project|user <text to match>',
+    '/memory replace brief|project|user <old text> => <new entry>',
+    '/memory write soul|brief|project|user <content>',
   ].join('\n')
 }
 
@@ -227,14 +229,19 @@ function PromptMemorySelector({
       description: 'Agent identity and tone',
     },
     {
-      label: 'BRIEF.md',
-      value: 'brief',
-      description: 'Stable agent facts and working notes',
-    },
-    {
       label: 'USER.md',
       value: 'user',
       description: 'User preferences and communication style',
+    },
+    {
+      label: 'PROJECT_EXPERIENCE.md',
+      value: 'project',
+      description: 'Reusable lessons and decisions for this project',
+    },
+    {
+      label: 'BRIEF.md',
+      value: 'brief',
+      description: 'Global methods distilled across projects',
     },
     {
       label: 'Instruction memory files',
@@ -248,7 +255,7 @@ function PromptMemorySelector({
       options={options}
       onChange={onSelect}
       onCancel={onCancel}
-      defaultFocusValue="brief"
+      defaultFocusValue="project"
     />
   )
 }
@@ -316,7 +323,7 @@ function MemoryCommand({
 
         <Box marginTop={1}>
           <Text dimColor>
-            Prompt memory: SOUL.md, BRIEF.md, USER.md. Learn more:{' '}
+            Prompt memory: SOUL.md, USER.md, PROJECT_EXPERIENCE.md, BRIEF.md. Learn more:{' '}
             <Link url="https://code.claude.com/docs/en/memory" />
           </Text>
         </Box>

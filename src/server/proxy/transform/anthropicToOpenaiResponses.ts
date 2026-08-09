@@ -14,10 +14,17 @@ import type {
   OpenAITool,
 } from './types.js'
 
+export type OpenAIResponsesTransformOptions = {
+  promptCacheKey?: string
+}
+
 /**
  * Convert Anthropic Messages request to OpenAI Responses API request.
  */
-export function anthropicToOpenaiResponses(body: AnthropicRequest): OpenAIResponsesRequest {
+export function anthropicToOpenaiResponses(
+  body: AnthropicRequest,
+  options: OpenAIResponsesTransformOptions = {},
+): OpenAIResponsesRequest {
   const input: OpenAIResponsesInputItem[] = []
 
   // Convert messages to input items
@@ -29,6 +36,9 @@ export function anthropicToOpenaiResponses(body: AnthropicRequest): OpenAIRespon
     model: body.model,
     input,
     stream: body.stream,
+    ...(options.promptCacheKey && {
+      prompt_cache_key: options.promptCacheKey,
+    }),
   }
 
   // system → instructions

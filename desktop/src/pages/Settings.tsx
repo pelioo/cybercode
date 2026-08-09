@@ -150,6 +150,11 @@ import {
   SmartRoutingPanel,
 } from '../components/providers/RoutingPanels'
 import { useRoutingStore } from '../stores/routingStore'
+import { ModelSelector } from '../components/controls/ModelSelector'
+import {
+  NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY,
+  useSessionRuntimeStore,
+} from '../stores/sessionRuntimeStore'
 
 const SETTINGS_TABS: SettingsTab[] = [
   'general',
@@ -264,6 +269,12 @@ export function ProviderSettings() {
   const fetchSettings = useSettingsStore((s) => s.fetchAll)
   const locale = useSettingsStore((s) => s.locale)
   const fetchRoutingDashboard = useRoutingStore((s) => s.fetchDashboard)
+  const routingDashboard = useRoutingStore((s) => s.dashboard)
+  const routingLoading = useRoutingStore((s) => s.isLoading)
+  const newSessionDefaultSelection = useSessionRuntimeStore(
+    (s) => s.selections[NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY],
+  )
+  const clearRuntimeSelection = useSessionRuntimeStore((s) => s.clearSelection)
   const t = useTranslation()
   const [providerView, setProviderView] = useState<'sources' | 'routing' | 'node' | 'status'>('sources')
   const [sourceQuery, setSourceQuery] = useState('')
@@ -372,6 +383,36 @@ export function ProviderSettings() {
     if (!hasLoadedProviders) return
     void fetchRoutingDashboard({ quiet: true })
   }, [fetchRoutingDashboard, hasLoadedProviders, providers])
+
+  useEffect(() => {
+    if (!newSessionDefaultSelection) return
+
+    if (newSessionDefaultSelection.routeId) {
+      if (!routingDashboard || routingLoading) return
+      const route = routingDashboard.config.profiles.find(
+        (profile) => profile.id === newSessionDefaultSelection.routeId,
+      )
+      if (!route?.graph) {
+        clearRuntimeSelection(NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY)
+      }
+      return
+    }
+
+    if (
+      hasLoadedProviders &&
+      newSessionDefaultSelection.providerId &&
+      !providers.some((provider) => provider.id === newSessionDefaultSelection.providerId)
+    ) {
+      clearRuntimeSelection(NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY)
+    }
+  }, [
+    clearRuntimeSelection,
+    hasLoadedProviders,
+    newSessionDefaultSelection,
+    providers,
+    routingDashboard,
+    routingLoading,
+  ])
 
   const providerRows = useMemo(
     () => buildProviderCatalogRows(
@@ -941,6 +982,45 @@ export function ProviderSettings() {
               </button>
             ))}
           </nav>
+
+          <section className="mt-[14px] border-t border-[var(--color-border-separator)] pt-[14px]">
+            <div className="flex min-w-0 items-start justify-between gap-[8px]">
+              <div className="min-w-0">
+                <h2 className="text-[12px] font-bold leading-[1.35] text-[var(--color-text-primary)]">
+                  {t('settings.routing.newSessionDefault.title')}
+                </h2>
+                <p className="mt-[4px] text-[10px] leading-[1.5] text-[var(--color-text-tertiary)]">
+                  {t('settings.routing.newSessionDefault.description')}
+                </p>
+              </div>
+              {newSessionDefaultSelection && (
+                <button
+                  type="button"
+                  onClick={() => clearRuntimeSelection(NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY)}
+                  aria-label={t('settings.routing.newSessionDefault.reset')}
+                  title={t('settings.routing.newSessionDefault.reset')}
+                  className="flex size-[28px] shrink-0 items-center justify-center rounded-[7px] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]"
+                >
+                  <Icon name="restart_alt" size={15} />
+                </button>
+              )}
+            </div>
+            <div className="mt-[10px]">
+              <ModelSelector
+                runtimeKey={NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY}
+                placement="bottom"
+                align="left"
+                compact
+                fullWidth
+                variant="pill"
+              />
+            </div>
+            {!newSessionDefaultSelection && (
+              <p className="mt-[6px] text-[9px] leading-[1.45] text-[var(--color-text-tertiary)]">
+                {t('settings.routing.newSessionDefault.followCurrent')}
+              </p>
+            )}
+          </section>
         </aside>
 
         <main className="provider-settings-main min-w-0">
@@ -3386,31 +3466,40 @@ function CompletionSoundSection() {
 
 // ─── Prompt Memory Settings ──────────────────────────────────────
 
-const MEMORY_TARGETS: PromptMemoryTarget[] = ['soul', 'brief', 'user']
+const MEMORY_TARGETS: PromptMemoryTarget[] = ['soul', 'user', 'project', 'brief']
 
 const MEMORY_TARGET_LABEL_KEYS = {
   soul: 'settings.memory.target.soul',
   brief: 'settings.memory.target.brief',
+  project: 'settings.memory.target.project',
   user: 'settings.memory.target.user',
 } as const
 
 const MEMORY_TARGET_DESCRIPTION_KEYS = {
   soul: 'settings.memory.target.soulDescription',
   brief: 'settings.memory.target.briefDescription',
+  project: 'settings.memory.target.projectDescription',
   user: 'settings.memory.target.userDescription',
 } as const
 
 const MEMORY_TARGET_ICONS = {
   soul: 'psychology',
   brief: 'memory',
+  project: 'folder',
   user: 'person',
+} as const
+
+const MEMORY_LOG_TARGET_KEYS = {
+  brief: 'settings.memory.autoLog.target.brief',
+  project: 'settings.memory.autoLog.target.project',
+  user: 'settings.memory.autoLog.target.user',
 } as const
 
 export function MemorySettings() {
   const t = useTranslation()
   const addToast = useUIStore((s) => s.addToast)
   const [activeView, setActiveView] = useState<'profile' | 'files' | 'history'>('profile')
-  const [target, setTarget] = useState<PromptMemoryTarget>('brief')
+  const [target, setTarget] = useState<PromptMemoryTarget>('project')
   const [status, setStatus] = useState<PromptMemoryStatus | null>(null)
   const [autoLogs, setAutoLogs] = useState<PromptMemoryAutoReviewLogEntry[]>([])
   const [insights, setInsights] = useState<PromptMemoryInsights | null>(null)
@@ -3735,8 +3824,8 @@ export function MemorySettings() {
               </span>
             </header>
 
-            <div className="grid h-[72px] grid-cols-3 border-b border-[var(--color-border-separator)] bg-[var(--color-surface-container-low)]">
-              {targetItems.map((item) => {
+            <div className="grid min-h-[72px] grid-cols-2 border-b border-[var(--color-border-separator)] bg-[var(--color-surface-container-low)] sm:grid-cols-4">
+              {targetItems.map((item, index) => {
                 const isActive = item.value === target
                 const file = status?.files[item.value]
                 return (
@@ -3745,7 +3834,11 @@ export function MemorySettings() {
                     type="button"
                     onClick={() => handleTargetChange(item.value)}
                     aria-pressed={isActive}
-                    className={`flex min-w-0 items-center justify-center gap-[9px] border-l border-[var(--color-border-separator)] px-[12px] text-left first:border-l-0 ${
+                    className={`flex min-h-[72px] min-w-0 items-center justify-center gap-[9px] border-[var(--color-border-separator)] px-[12px] text-left ${
+                      index % 2 === 1 ? 'border-l' : ''
+                    } ${index >= 2 ? 'border-t sm:border-t-0' : ''} ${
+                      index > 0 ? 'sm:border-l' : ''
+                    } ${
                       isActive
                         ? 'bg-[var(--color-text-primary)] text-[var(--color-background)]'
                         : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]'
@@ -3860,7 +3953,7 @@ export function MemorySettings() {
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-x-[8px] gap-y-[3px] text-[10px] leading-[15px] text-[var(--color-text-tertiary)]">
                     <span className="font-semibold text-[var(--color-text-primary)]">{t(`settings.memory.autoLog.action.${entry.action}` as never)}</span>
-                    <span>{t(entry.target === 'user' ? 'settings.memory.autoLog.target.user' : 'settings.memory.autoLog.target.brief')}</span>
+                    <span>{t(MEMORY_LOG_TARGET_KEYS[entry.target])}</span>
                     <span>{t(`settings.memory.autoLog.trigger.${entry.trigger}` as never)}</span>
                     <span>{formatMemoryLogTime(entry.timestamp)}</span>
                   </div>

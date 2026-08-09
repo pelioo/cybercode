@@ -31,22 +31,20 @@ describe('Ponytail token optimization', () => {
 
     const service = new PonytailOptimizationService()
     expect(service.getStatus()).toEqual({ enabled: false, mode: 'full' })
-    expect(service.getSystemPrompt()).toBeNull()
+    expect(service.getPolicyContribution()).toBeNull()
 
     const writer = new PonytailOptimizationService()
     expect(writer.setEnabled(true)).toEqual({ enabled: true, mode: 'full' })
     expect(service.getStatus().enabled).toBe(true)
-    expect(service.getSystemPrompt()).toContain('# Ponytail')
-    expect(service.getSystemPrompt()).toContain('smallest complete change')
-    expect(service.getSystemPrompt()).toContain('Reuse existing helpers')
-    expect(service.getSystemPrompt()).toContain('validation, security')
-    expect(service.getSystemPrompt()!.length).toBeLessThan(600)
-    expect(service.getSystemPrompt()).not.toContain('Be concise and direct')
-    expect(service.getSystemPrompt()).not.toContain('Lazy Programmer')
+    expect(service.getPolicyContribution()).toEqual({
+      source: 'optimization',
+      label: 'Ponytail',
+      execution: { discipline: 'strict' },
+    })
 
     writer.setEnabled(false)
     expect(service.getStatus().enabled).toBe(false)
-    expect(service.getSystemPrompt()).toBeNull()
+    expect(service.getPolicyContribution()).toBeNull()
   })
 
   test('falls back to disabled when the persisted config is invalid', () => {
@@ -61,7 +59,7 @@ describe('Ponytail token optimization', () => {
 
     const service = new PonytailOptimizationService()
     expect(service.getStatus()).toEqual({ enabled: false, mode: 'full' })
-    expect(service.getSystemPrompt()).toBeNull()
+    expect(service.getPolicyContribution()).toBeNull()
   })
 
   test('serves the global switch through the token optimization API', async () => {

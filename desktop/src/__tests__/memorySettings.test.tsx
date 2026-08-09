@@ -15,7 +15,7 @@ function jsonResponse(body: unknown) {
 }
 
 function memoryFile(
-  target: 'soul' | 'brief' | 'user',
+  target: 'soul' | 'brief' | 'project' | 'user',
   content = '',
   entries = content ? [content] : [],
 ) {
@@ -61,6 +61,8 @@ describe('MemorySettings evolution profile', () => {
           stats: {
             total: userEntries.length,
             user: userEntries.length,
+            project: 0,
+            globalMethods: 0,
             methods: 0,
             dimensions: userEntries.length ? 1 : 0,
             automaticUpdates: 0,
@@ -113,6 +115,7 @@ describe('MemorySettings evolution profile', () => {
           files: {
             soul: memoryFile('soul', 'You are CyberCode.'),
             brief: memoryFile('brief'),
+            project: memoryFile('project'),
             user: memoryFile(
               'user',
               userEntries.join('\n\n---\n\n'),

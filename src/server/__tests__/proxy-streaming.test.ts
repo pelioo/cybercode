@@ -91,6 +91,27 @@ describe('openaiChatStreamToAnthropic', () => {
     expect((msgDelta.data.delta as Record<string, unknown>).stop_reason).toBe('end_turn')
   })
 
+  test('reports cached input usage without double-counting it', async () => {
+    const sseChunks = [
+      'data: {"id":"cache-chat","object":"chat.completion.chunk","created":0,"model":"gpt-5","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}\n\n',
+      'data: {"id":"cache-chat","object":"chat.completion.chunk","created":0,"model":"gpt-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: {"id":"cache-chat","object":"chat.completion.chunk","created":0,"model":"gpt-5","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":80}}}\n\n',
+      'data: [DONE]\n\n',
+    ]
+
+    const events = await collectSse(openaiChatStreamToAnthropic(
+      makeStream(sseChunks),
+      'gpt-5',
+    ))
+    const usage = events.find((event) => event.event === 'message_delta')!
+      .data.usage as Record<string, unknown>
+
+    expect(usage.input_tokens).toBe(20)
+    expect(usage.cache_read_input_tokens).toBe(80)
+    expect(usage.cache_creation_input_tokens).toBe(0)
+    expect(usage.output_tokens).toBe(5)
+  })
+
   test('tool call streaming', async () => {
     const sseChunks = [
       'data: {"id":"c2","object":"chat.completion.chunk","created":0,"model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}\n\n',
@@ -368,7 +389,7 @@ describe('openaiResponsesStreamToAnthropic', () => {
       'event: response.output_text.delta\ndata: {"output_index":0,"content_index":0,"delta":"Hello"}\n\n',
       'event: response.output_text.delta\ndata: {"output_index":0,"content_index":0,"delta":" world"}\n\n',
       'event: response.output_text.done\ndata: {"output_index":0,"content_index":0,"text":"Hello world"}\n\n',
-      'event: response.completed\ndata: {"response":{"id":"r1","model":"gpt-4o","status":"completed","usage":{"input_tokens":10,"output_tokens":5}}}\n\n',
+      'event: response.completed\ndata: {"response":{"id":"r1","model":"gpt-4o","status":"completed","usage":{"input_tokens":100,"output_tokens":5,"input_tokens_details":{"cached_tokens":80}}}}\n\n',
     ]
 
     const upstream = makeStream(sseChunks)
@@ -388,6 +409,13 @@ describe('openaiResponsesStreamToAnthropic', () => {
     const texts = textDeltas.map((e) => (e.data.delta as Record<string, unknown>).text)
     expect(texts).toContain('Hello')
     expect(texts).toContain(' world')
+
+    const usage = events.find((event) => event.event === 'message_delta')!
+      .data.usage as Record<string, unknown>
+    expect(usage.input_tokens).toBe(20)
+    expect(usage.cache_read_input_tokens).toBe(80)
+    expect(usage.cache_creation_input_tokens).toBe(0)
+    expect(usage.output_tokens).toBe(5)
   })
 
   test('function call streaming', async () => {

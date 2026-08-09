@@ -169,8 +169,8 @@ function getTeammateMailbox(): typeof import('./teammateMailbox.js') {
 }
 
 import {
+  isNativeToolSearchEnabledOptimistic,
   isToolReferenceBlock,
-  isToolSearchEnabledOptimistic,
 } from './toolSearch.js'
 
 const MEMORY_CORRECTION_HINT =
@@ -2101,7 +2101,7 @@ export function normalizeMessagesForAPI(
           // When tool search IS enabled, strip only tool_reference blocks for
           // tools that no longer exist (e.g., MCP server was disconnected).
           let normalizedMessage = message
-          if (!isToolSearchEnabledOptimistic()) {
+          if (!isNativeToolSearchEnabledOptimistic()) {
             normalizedMessage = stripToolReferenceBlocksFromUserMessage(message)
           } else {
             normalizedMessage = stripUnavailableToolReferencesFromUserMessage(
@@ -2203,7 +2203,7 @@ export function normalizeMessagesForAPI(
           // When tool search is NOT enabled, we must strip tool_search-specific fields
           // like 'caller' from tool_use blocks, as these are only valid with the
           // tool search beta header
-          const toolSearchEnabled = isToolSearchEnabledOptimistic()
+          const toolSearchEnabled = isNativeToolSearchEnabledOptimistic()
           const normalizedMessage: AssistantMessage = {
             ...message,
             message: {

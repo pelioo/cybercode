@@ -1,6 +1,6 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import ponytailRules from '../defaults/ponytail-rules.md' with { type: 'text' }
+import type { PromptPolicyContribution } from '../constants/promptPolicy.js'
 import { getClaudeConfigHomeDir } from '../utils/envUtils.js'
 
 export type PonytailStatus = {
@@ -14,10 +14,6 @@ type StoredConfig = {
 }
 
 const DEFAULT_CONFIG: StoredConfig = { version: 1, enabled: false }
-
-// Adapted for CyberCode from DietrichGebert/ponytail's MIT-licensed rules.
-// Source: https://github.com/DietrichGebert/ponytail
-const PONYTAIL_SYSTEM_PROMPT = ponytailRules.trimEnd()
 
 export class PonytailOptimizationService {
   private cachedConfig: StoredConfig | null = null
@@ -39,8 +35,15 @@ export class PonytailOptimizationService {
     return this.getStatus()
   }
 
-  getSystemPrompt(): string | null {
-    return this.isEnabled() ? PONYTAIL_SYSTEM_PROMPT : null
+  getPolicyContribution(): PromptPolicyContribution | null {
+    if (!this.isEnabled()) return null
+    // Adapted from DietrichGebert/ponytail's MIT-licensed rules. The canonical
+    // renderer owns the wording so enabling this mode cannot duplicate it.
+    return {
+      source: 'optimization',
+      label: 'Ponytail',
+      execution: { discipline: 'strict' },
+    }
   }
 
   resetForTesting() {

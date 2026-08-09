@@ -310,7 +310,7 @@ export function logAPIPrefix(systemPrompt: SystemPrompt): void {
  *    - Attribution header (cacheScope=null)
  *    - System prompt prefix (cacheScope=null)
  *    - Static content before boundary (cacheScope='global')
- *    - Dynamic content after boundary (cacheScope=null)
+ *    - Dynamic content after boundary (cacheScope='org')
  *
  * 3. Default mode (3P providers, or boundary missing):
  *    Returns up to 3 blocks with org-level caching:
@@ -393,7 +393,13 @@ export function splitSysPromptPrefix(
       if (staticJoined)
         result.push({ text: staticJoined, cacheScope: 'global' })
       const dynamicJoined = dynamicBlocks.join('\n\n')
-      if (dynamicJoined) result.push({ text: dynamicJoined, cacheScope: null })
+      // Dynamic here means session-specific, not per-request random. Prompt
+      // memory is frozen for the session and policy output is deterministic,
+      // so cache it in the provider's isolated workspace/org scope. When a
+      // setting changes, only this second-level prefix is rewritten while the
+      // global static prefix remains reusable.
+      if (dynamicJoined)
+        result.push({ text: dynamicJoined, cacheScope: 'org' })
 
       logEvent('tengu_sysprompt_boundary_found', {
         blockCount: result.length,

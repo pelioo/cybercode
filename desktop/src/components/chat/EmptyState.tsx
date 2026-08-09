@@ -5,7 +5,11 @@ import { useTranslation, type TranslationKey } from '../../i18n'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useChatStore } from '../../stores/chatStore'
 import { useProviderStore } from '../../stores/providerStore'
-import { useSessionRuntimeStore, DRAFT_RUNTIME_SELECTION_KEY } from '../../stores/sessionRuntimeStore'
+import {
+  useSessionRuntimeStore,
+  DRAFT_RUNTIME_SELECTION_KEY,
+  NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY,
+} from '../../stores/sessionRuntimeStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useUIStore } from '../../stores/uiStore'
 import { useTabStore } from '../../stores/tabStore'
@@ -96,8 +100,10 @@ function HeroEmptyStateForDraft({ t }: { t: TranslateFn }) {
           ? providerState.providers.find((provider) => provider.name === settings.activeProviderName)?.id ?? null
           : null
       )
+      const runtimeSelections = useSessionRuntimeStore.getState().selections
       const draftSelection =
-        useSessionRuntimeStore.getState().selections[DRAFT_RUNTIME_SELECTION_KEY]
+        runtimeSelections[DRAFT_RUNTIME_SELECTION_KEY]
+        ?? runtimeSelections[NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY]
         ?? {
           providerId: inferredProviderId,
           modelId: settings.currentModel?.id ?? OFFICIAL_DEFAULT_MODEL_ID,

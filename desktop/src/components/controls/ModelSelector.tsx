@@ -8,7 +8,11 @@ import { useTranslation } from '../../i18n'
 import { subscribeToViewportChanges } from '../../lib/viewportEvents'
 import { useChatStore } from '../../stores/chatStore'
 import { useProviderStore } from '../../stores/providerStore'
-import { DRAFT_RUNTIME_SELECTION_KEY, useSessionRuntimeStore } from '../../stores/sessionRuntimeStore'
+import {
+  DRAFT_RUNTIME_SELECTION_KEY,
+  NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY,
+  useSessionRuntimeStore,
+} from '../../stores/sessionRuntimeStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useRoutingStore } from '../../stores/routingStore'
 import type { SavedProvider } from '../../types/provider'
@@ -51,6 +55,7 @@ type Props = {
   placement?: 'top' | 'bottom'
   align?: 'left' | 'right'
   compact?: boolean
+  fullWidth?: boolean
   variant?: 'default' | 'pill'
   openSignal?: number
 }
@@ -217,6 +222,7 @@ export function ModelSelector({
   placement = 'top',
   align = 'right',
   compact = false,
+  fullWidth = false,
   variant = 'default',
   openSignal,
 }: Props = {}) {
@@ -241,6 +247,9 @@ export function ModelSelector({
   const fetchRoutingDashboard = useRoutingStore((state) => state.fetchDashboard)
   const storedRuntimeSelection = useSessionRuntimeStore((state) =>
     runtimeKey ? state.selections[runtimeKey] : undefined,
+  )
+  const newSessionDefaultSelection = useSessionRuntimeStore(
+    (state) => state.selections[NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY],
   )
   const [open, setOpen] = useState(false)
   const [menuView, setMenuView] = useState<'routes' | 'models'>('models')
@@ -386,12 +395,17 @@ export function ModelSelector({
     : storeModel
 
   const activeRuntimeSelection = isRuntimeScoped
-    ? runtimeValue ?? storedRuntimeSelection ?? resolveDefaultRuntimeSelection(
-      activeId,
-      activeProviderName,
-      providers,
-      storeModel?.id,
-    )
+    ? runtimeValue
+      ?? storedRuntimeSelection
+      ?? (runtimeKey === DRAFT_RUNTIME_SELECTION_KEY
+        ? newSessionDefaultSelection
+        : undefined)
+      ?? resolveDefaultRuntimeSelection(
+        activeId,
+        activeProviderName,
+        providers,
+        storeModel?.id,
+      )
     : null
 
   const activeRouteId = activeRuntimeSelection?.routeId
@@ -509,7 +523,10 @@ export function ModelSelector({
       onRuntimeChange(selection)
     } else if (runtimeKey) {
       useSessionRuntimeStore.getState().setSelection(runtimeKey, selection)
-      if (runtimeKey !== DRAFT_RUNTIME_SELECTION_KEY) {
+      if (
+        runtimeKey !== DRAFT_RUNTIME_SELECTION_KEY &&
+        runtimeKey !== NEW_SESSION_DEFAULT_RUNTIME_SELECTION_KEY
+      ) {
         useChatStore.getState().setSessionRuntime(runtimeKey, selection)
       }
     }
@@ -521,7 +538,7 @@ export function ModelSelector({
   const compactLabelClassName = variant === 'pill' ? 'max-w-[128px]' : 'max-w-[128px]'
 
   return (
-    <div ref={ref} className="relative">
+    <div ref={ref} className={`relative ${fullWidth ? 'w-full' : ''}`}>
       <button
         ref={triggerRef}
         onClick={() => !disabled && setOpen(!open)}
@@ -535,6 +552,7 @@ export function ModelSelector({
             ? compactClassName
             : 'min-h-[40px] max-w-[300px] gap-2 rounded-[8px] border border-[var(--color-border)] bg-[var(--color-surface-container)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
           }
+          ${fullWidth ? '!w-full !max-w-none justify-between' : ''}
         `}
       >
         {compact && activeRouteId ? (
@@ -553,7 +571,7 @@ export function ModelSelector({
             decorative
           />
         ) : null}
-        <span className={`min-w-0 truncate ${compact ? compactLabelClassName : 'flex-1 text-[14px] font-semibold text-[var(--color-text-primary)]'}`} style={compact ? undefined : { fontFamily: 'var(--font-headline)' }}>
+        <span className={`min-w-0 truncate ${compact ? compactLabelClassName : 'flex-1 text-[14px] font-semibold text-[var(--color-text-primary)]'} ${fullWidth ? '!max-w-none flex-1 text-left' : ''}`} style={compact ? undefined : { fontFamily: 'var(--font-headline)' }}>
           {buttonModelLabel}
         </span>
         {!compact && buttonProviderLabel && (

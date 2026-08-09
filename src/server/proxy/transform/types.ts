@@ -50,6 +50,8 @@ export type OpenAIChatRequest = {
   tool_choice?: unknown
   reasoning_effort?: 'low' | 'medium' | 'high' | 'max'
   thinking?: { type: 'enabled' | 'disabled' }
+  prompt_cache_key?: string
+  stream_options?: { include_usage: boolean }
 }
 
 export type OpenAIChatResponse = {
@@ -125,6 +127,7 @@ export type OpenAIResponsesRequest = {
   tools?: OpenAITool[]
   tool_choice?: unknown
   reasoning?: { effort?: 'low' | 'medium' | 'high' }
+  prompt_cache_key?: string
 }
 
 export type OpenAIResponsesOutputItem =
@@ -143,6 +146,9 @@ export type OpenAIResponsesResponse = {
     input_tokens: number
     output_tokens: number
     total_tokens: number
+    input_tokens_details?: {
+      cached_tokens?: number
+    }
   }
 }
 

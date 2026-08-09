@@ -10,6 +10,7 @@ import {
 import { addPromptMemoryEntry, readPromptMemoryFile } from '../../promptMemory/store.js'
 import { readPromptMemoryConfig } from '../../promptMemory/config.js'
 import { handlePromptMemoryApi } from '../api/prompt-memory.js'
+import { getAutoMemPath } from '../../memdir/paths.js'
 
 function makeRequest(
   path: string,
@@ -44,6 +45,7 @@ describe('Prompt Memory API', () => {
     delete process.env.CYBER_CONFIG_DIR
     delete process.env.CLAUDE_CONFIG_DIR
     _setConfigHomeDirHomeForTesting(tmpHome)
+    getAutoMemPath.cache.clear()
   })
 
   afterEach(async () => {
@@ -57,11 +59,16 @@ describe('Prompt Memory API', () => {
     else process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir
     _setConfigHomeDirHomeForTesting(undefined)
     _resetConfigHomeDirForTesting()
+    getAutoMemPath.cache.clear()
     await rm(tmpRoot, { recursive: true, force: true })
   })
 
   test('returns categorized self-evolution insights', async () => {
     await addPromptMemoryEntry('user', '用户给 CyberCode 取名为「零」。')
+    await addPromptMemoryEntry(
+      'project',
+      '[decision] Keep route selection in the desktop settings store.',
+    )
     await addPromptMemoryEntry(
       'brief',
       '[meta-method] Discuss ambiguous behavior before implementation.',
@@ -75,10 +82,25 @@ describe('Prompt Memory API', () => {
     )
     expect(response.status).toBe(200)
     const body = await response.json() as {
-      stats: { total: number; user: number; methods: number }
+      stats: {
+        total: number
+        user: number
+        project: number
+        globalMethods: number
+        methods: number
+      }
       insights: Array<{ target: string; category: string; content: string }>
     }
-    expect(body.stats).toMatchObject({ total: 2, user: 1, methods: 1 })
+    expect(body.stats).toMatchObject({
+      total: 3,
+      user: 1,
+      project: 1,
+      globalMethods: 1,
+      methods: 2,
+    })
+    expect(body.insights).toContainEqual(
+      expect.objectContaining({ target: 'project', category: 'decision' }),
+    )
     expect(body.insights).toContainEqual(
       expect.objectContaining({ target: 'user', category: 'identity' }),
     )
