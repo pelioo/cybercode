@@ -199,15 +199,15 @@ jobs:
 
       # ── Install dependencies ─────────────────────────────────
       - name: Install root dependencies
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - name: Install desktop dependencies
         working-directory: desktop
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - name: Install adapter dependencies
         working-directory: adapters
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - name: Validate built-in tool result contracts
         run: bun test src/tools/toolContract.test.ts
