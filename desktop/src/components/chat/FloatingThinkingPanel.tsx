@@ -9,6 +9,7 @@ import {
 
 import { useTranslation } from '../../i18n'
 import { Icon } from '../shared/Icon'
+import { ActivityCollapse } from './ActivityCollapse'
 import { CHAT_ACTIVITY_BODY_MAX_HEIGHT_CLASS } from './activityPanelLayout'
 
 type FloatingThinkingPanelProps = {
@@ -202,18 +203,18 @@ export function FloatingThinkingPanel({
             className="flex h-4 w-4 shrink-0 items-center justify-center"
           >
             <Icon
-              name={expanded ? 'expand_less' : 'expand_more'}
+              name="expand_more"
               size={16}
-              className="text-[var(--color-outline)]"
+              className={`text-[var(--color-outline)] transition-transform duration-300 ${expanded ? 'rotate-180' : 'rotate-0'}`}
+              style={{ transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)' }}
             />
           </span>
         </button>
 
-        {expanded && (
+        <ActivityCollapse open={expanded} testId="thinking-message-panel-collapse">
           <div
             ref={bodyRef}
             className={`scrollbar-no-track ${CHAT_ACTIVITY_BODY_MAX_HEIGHT_CLASS} overflow-y-auto border-t border-[var(--color-border-separator)]/45 px-[16px] py-[12px]`}
-            style={{ animation: 'fade-in 200ms cubic-bezier(0.16, 1, 0.3, 1)' }}
             onScroll={handleScroll}
             onWheelCapture={(event) => {
               const body = bodyRef.current
@@ -237,7 +238,7 @@ export function FloatingThinkingPanel({
               {displayContent}
             </div>
           </div>
-        )}
+        </ActivityCollapse>
       </div>
     </div>
   )

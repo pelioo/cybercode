@@ -45,6 +45,7 @@ type SettingsStore = {
   locale: Locale
   theme: ThemeMode
   skipWebFetchPreflight: boolean
+  autoSessionTitleEnabled: boolean
   completionSoundEnabled: boolean
   completionSoundId: CompletionSoundSetting
   completionSoundCustomName: string | null
@@ -59,6 +60,7 @@ type SettingsStore = {
   setLocale: (locale: Locale) => Promise<void>
   setTheme: (theme: ThemeMode) => Promise<void>
   setSkipWebFetchPreflight: (enabled: boolean) => Promise<void>
+  setAutoSessionTitleEnabled: (enabled: boolean) => Promise<void>
   setCompletionSoundEnabled: (enabled: boolean) => Promise<void>
   setCompletionSoundId: (soundId: CompletionSoundSetting) => Promise<void>
   setCompletionSoundCustom: (custom: { name: string; data: string } | null) => Promise<void>
@@ -73,6 +75,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   locale: getStoredLocale(),
   theme: useUIStore.getState().theme,
   skipWebFetchPreflight: true,
+  autoSessionTitleEnabled: true,
   completionSoundEnabled: false,
   completionSoundId: 'ding',
   completionSoundCustomName: null,
@@ -105,6 +108,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         effortLevel: level,
         theme,
         skipWebFetchPreflight: userSettings.skipWebFetchPreflight !== false,
+        autoSessionTitleEnabled: userSettings.autoSessionTitleEnabled !== false,
         completionSoundEnabled: userSettings.completionSoundEnabled === true,
         completionSoundId: completionSoundSetting(userSettings.completionSoundId),
         completionSoundCustomName: typeof userSettings.completionSoundCustomName === 'string'
@@ -175,6 +179,16 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       await settingsApi.updateUser({ skipWebFetchPreflight: enabled })
     } catch {
       set({ skipWebFetchPreflight: prev })
+    }
+  },
+
+  setAutoSessionTitleEnabled: async (enabled) => {
+    const prev = get().autoSessionTitleEnabled
+    set({ autoSessionTitleEnabled: enabled })
+    try {
+      await settingsApi.updateUser({ autoSessionTitleEnabled: enabled })
+    } catch {
+      set({ autoSessionTitleEnabled: prev })
     }
   },
 

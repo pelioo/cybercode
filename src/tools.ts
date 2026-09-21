@@ -62,6 +62,7 @@ import { GoalStatusTool } from './tools/GoalStatusTool/GoalStatusTool.js'
 import { ExitPlanModeV2Tool } from './tools/ExitPlanModeTool/ExitPlanModeV2Tool.js'
 import { TestingPermissionTool } from './tools/testing/TestingPermissionTool.js'
 import { GrepTool } from './tools/GrepTool/GrepTool.js'
+import { BrowserTaskTool } from './tools/BrowserTaskTool/BrowserTaskTool.js'
 import { CodeGraphTool } from './tools/CodeGraphTool/CodeGraphTool.js'
 import { CODEGRAPH_MCP_SERVER_NAME } from './tools/CodeGraphTool/constants.js'
 import { TungstenTool } from './tools/TungstenTool/TungstenTool.js'
@@ -207,6 +208,7 @@ export function getAllBaseTools(): Tools {
     // to these fast tools, so the dedicated Glob/Grep tools are unnecessary.
     ...(hasEmbeddedSearchTools() ? [] : [GlobTool, GrepTool]),
     CodeGraphTool,
+    BrowserTaskTool,
     ExitPlanModeV2Tool,
     FileReadTool,
     FileEditTool,

@@ -1320,6 +1320,7 @@ export function ChatInput({ variant = 'default', sessionId: sessionIdProp, proje
                     compact
                     variant="pill"
                     openSignal={modelSelectorOpenSignal || undefined}
+                    showNewSessionDefaultAction
                   />
                 </div>
               )}

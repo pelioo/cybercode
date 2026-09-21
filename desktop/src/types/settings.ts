@@ -22,6 +22,7 @@ export type UserSettings = {
   language?: string
   promptMemoryLanguage?: string
   skipWebFetchPreflight?: boolean
+  autoSessionTitleEnabled?: boolean
   completionSoundEnabled?: boolean
   completionSoundId?: string
   completionSoundCustomName?: string
